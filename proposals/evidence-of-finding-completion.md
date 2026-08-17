@@ -5,7 +5,6 @@
   (merged [#4](https://github.com/kubescape/designs-and-proposals/pull/4), author Yugal Sadhwani).
   This document does not replace or re-litigate that design; it is a status check against it plus
   a phased plan for what is left.
-- **LFX program:** [CNCF - Kubescape: Evidence of Finding: Path-Level Evidence in Scan Output (2026 Term 3)](https://github.com/cncf/mentoring/issues/1988)
 - **Scope:** [`kubescape`](https://github.com/kubescape/kubescape) CLI
   (`core/pkg/resultshandling/printer/v2`, `core/pkg/fixhandler`), [`opa-utils`](https://github.com/kubescape/opa-utils) (phased)
 - **Author:** Aditya Raut (<araut7798@gmail.com>)
