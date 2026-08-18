@@ -21,9 +21,9 @@ it. Static posture (the "Agent Runtime Hardening" framework) verifies the actor
 is configured to use gVisor and to deny egress — it says "the door is locked."
 But once the actor is running, the thing we most want to watch — what that
 untrusted code actually does — is exactly what the current host-kernel sensor
-cannot see, because those syscalls never reach the host kernel. The issue states
-it directly: gVisor-isolated actors "remain opaque to kernel-level eBPF
-monitoring." Runtime visibility is the "someone is climbing through the window
+cannot see, because those syscalls never reach the host kernel. The issue states it directly: "gVisor intercepts syscalls in userspace (the
+Sentry), so the node-agent's kernel-level eBPF hooks can't see inside a
+gVisor-isolated actor the way they see a normal container." Runtime visibility is the "someone is climbing through the window
 anyway" signal that posture alone cannot provide.
 
 ## Goals
@@ -39,17 +39,20 @@ anyway" signal that posture alone cannot provide.
 ## Non-goals
 
 - No changes to the static posture controls or the framework (that is #10 and the
-  regolibrary work).
+  regolibrary work, e.g. regolibrary#789).
 - No claim to see *inside* model reasoning; this is OS-level behavior of the actor
   process.
 - Not a full production node-agent integration in this proposal — the tracer seam
-  and multi-sandbox sink broker are described and scoped, not fully built.
+  and multi-consumer sink broker are described and scoped, not fully built.
 
 ## Candidate signal sources
 
 Three ways to recover visibility; lead with one, keep a second as fallback.
 
-**1. Sentry `seccheck` remote sink (recommended primary).** gVisor's first-class
+**1. Sentry `seccheck` remote sink (recommended primary; independently
+identified as the strongest candidate in
+[node-agent#894](https://github.com/kubescape/node-agent/issues/894)).**
+gVisor's first-class
 trace subsystem streams structured protobuf trace points over a `SOCK_SEQPACKET`
 UDS to an external monitor. Points carry rich context (container id, thread
 id/tgid, process name, cwd, credentials, timestamps) and per-syscall detail (e.g.
@@ -71,11 +74,20 @@ fallback when source 1 is unavailable, and an independent cross-check.
 | Dimension | seccheck (1) | strace (2) | host-boundary (3) |
 |---|---|---|---|
 | Granularity | per-syscall, structured | per-syscall, text | coarse |
-| Stable interface | yes (versioned protobuf) | no | yes |
+| Stable interface | handshake-versioned wire protocol; point schemas **not** stability-guaranteed | no | yes |
 | Dynamic attach to running sandbox | yes | partial | n/a |
 | Trusts the Sentry | yes | yes | no |
 | Session contention | yes (single `Default`) | no | no |
 | Production-suitable | **yes (primary)** | dev only | **yes (fallback)** |
+
+A note on schema stability: the trace-point protos are not a stable public
+API — Falco removed its gVisor engine in v0.44.0 (May 2026) rather than keep
+absorbing this drift. The design mitigates it by isolating all decoding behind
+bindings generated from vendored `.proto` files (with recorded provenance),
+versioning the decode, and keeping the `runsc` metric-server endpoint as a
+stable-but-coarse alternative. The connect-time handshake additionally lets the
+collector negotiate versions and skip-and-count unknown point types rather than
+fail.
 
 ## Proposal
 
@@ -91,12 +103,21 @@ pipeline. Normalization mapping:
 | `SENTRY_CLONE` / `CLONE` / `FORK` | `fork` |
 | `SENTRY_TASK_EXIT` / `EXIT_NOTIFY_PARENT` | `exit` |
 | `PTRACE` | `ptrace` |
-| `CONTAINER_START` | (metadata: sandbox↔container correlation) |
+| `CONTAINER_START` | (metadata: sandbox/container correlation) |
+
+Names are shorthand for the wire `MESSAGE_*` types (e.g. `MESSAGE_SYSCALL_CONNECT`,
+`MESSAGE_CONTAINER_START`).
 
 ## The `Default`-session constraint (and fallback)
 
-gVisor currently supports exactly one trace session, named `Default`
-(`pkg/sentry/seccheck/config.go`). Consequences and mitigations:
+gVisor currently supports exactly one trace session **per sandbox**, and it
+must be named `Default` — `pkg/sentry/seccheck/config.go` enforces
+`only a single "Default" session is supported`, with the comment "When multiple
+sessions are supported, this can be removed." Collection itself needs no
+broker: the remote sink already allows "a single process to monitor all
+sandboxes in the machine" (sinks/remote README). The scarce resource is each
+sandbox's one session — a downstream sharing problem, not a collection problem.
+Consequences and mitigations:
 
 1. **Contention** — if the platform or another tool already installed `Default`,
    node-agent's attach fails; it must detect this rather than assume ownership.
@@ -128,6 +149,12 @@ A companion PoC implements source 1 end-to-end:
   `--runtime=runsc` container) using the identical collector code.
 - Unit tests over decode + mapping.
 
+- Prior-art note: gVisor ships `tools/tracereplay` for generic save/replay of
+  remote-sink sessions. `fakesentry` differs in what it *asserts* — the
+  seccheck-to-node-agent normalization contract (wire message to decode to expected
+  exec/network/open semantics) — and `tracereplay` can complement it later by
+  capturing real-session fixtures.
+
 No Kubernetes cluster is required to see it work; the real-gVisor path needs only
 Docker + runsc on any Linux box (no GKE).
 
@@ -138,12 +165,37 @@ the following (OWASP Top 10 for LLM Applications 2025; MITRE ATLAS):
 
 | Control / capability | OWASP LLM (2025) | MITRE ATLAS |
 |---|---|---|
-| C-0297 hardened runtime class (isolation) | LLM06 Excessive Agency; LLM05 Improper Output Handling | Execution / Defense-Evasion tactics; limits blast radius of AML.T0086 (Exfiltration via AI Agent Tool Invocation) |
-| C-0301 egress default-deny | LLM02 Sensitive Information Disclosure; LLM06 Excessive Agency | Exfiltration tactic; AML.T0024 (Exfiltration via AI Inference API), AML.T0086 |
+| C-0297 hardened runtime class (isolation) | LLM06 Excessive Agency; LLM05 Improper Output Handling | Execution / Defense-Evasion tactics; limits blast radius of AML.T0053 (AI Agent Tool Invocation) |
+| C-0301 egress default-deny | LLM02 Sensitive Information Disclosure; LLM06 Excessive Agency | Exfiltration tactic; AML.T0024 (Exfiltration via AI Inference API); constrains exfiltration reached via AML.T0053 (AI Agent Tool Invocation) |
 | Runtime visibility (this proposal) | LLM06 Excessive Agency; LLM02 Sensitive Information Disclosure | Detection across Execution / Exfiltration; observes AML.T0051 (LLM Prompt Injection) downstream effects |
 
 (Technique IDs are from the current ATLAS matrix; tactic-level mapping is given
 where a technique does not map 1:1. Refinement welcome.)
+
+## Security considerations
+
+The collector sits on a trust boundary: the *channel* is Sentry-side, but the
+message *content* originates in the sandboxed workload — the adversary in
+gVisor's threat model. The remote-sink documentation is explicit: "the
+monitoring process must validate and never trust input received from the
+Sentry because it can be controlled by a malicious user. All fields must have
+hard coded size limits."
+
+- **Hard-coded field size caps** on every string/bytes field (argv, paths,
+  process names) — implemented in the PoC collector.
+- **Unknown points/versions tolerated:** the connect-time handshake negotiates
+  compatibility; unknown message types are skipped and counted, never fatal.
+- **Dropped-message accounting:** the wire header's control fields carry drop
+  counts; the collector surfaces them as metrics so shedding is observable,
+  not silent.
+- **Backpressure without touching the actor's hot path:** bounded
+  per-connection buffers with shed-and-count behavior; the sensor is
+  out-of-band by construction and never blocks the Sentry.
+- **Per-sandbox connection isolation:** one hostile or excessively chatty
+  actor must not starve other sandboxes' streams.
+- **Sensitive payloads:** full-argv capture and execve binary hashing are
+  opt-in; recovered fields should be maskable consistent with PII policy
+  before persistence or export.
 
 ## node-agent integration path
 
@@ -153,8 +205,13 @@ where a technique does not map 1:1. Refinement welcome.)
    feed the existing `eventreporters` / rule-manager path.
 3. Correlate the seccheck `container_id` to the pod/actor via node-agent's
    existing container→workload mapping, seeded by `CONTAINER_START`.
-4. Derive higher-level signals where cheap (DNS from connect payloads,
-   sensitive-file access from open paths) reusing existing rules.
+4. Derive higher-level signals where cheap: sensitive-file access from `open`
+   paths, and domain enrichment by correlating recovered `connect()`
+   destinations (a sockaddr carries IP/port/family, not the originating
+   hostname) with node-agent's existing DNS tracer and `pkg/dnsmanager`
+   address-to-domain cache, where that relationship is observable. Query-level
+   analytics (DGA entropy, DNS exfiltration) require the DNS trace points
+   themselves and are future work.
 
 ## Alternatives considered
 
@@ -177,5 +234,8 @@ where a technique does not map 1:1. Refinement welcome.)
 
 - Issue: kubescape/kubescape#2557 (Part B)
 - Companion static-posture proposal: designs-and-proposals#10
-- gVisor seccheck: `pkg/sentry/seccheck/` and the remote-sink README
-- Companion PoC: `gvisor-visibility-poc` (collector, cluster-free E2E, runsc path)
+- gVisor seccheck: `pkg/sentry/seccheck/` (config.go session restriction); `sinks/remote` README (untrusted-input guidance); `tools/tracereplay`
+- Prior art: kubescape/node-agent#894 — identifies seccheck and the
+  single-session limitation (note-only); this proposal and its PoC are the
+  executable design over that observation.
+- Companion PoC: [gvisor-visibility-poc](https://github.com/yellow-forrest/gvisor-visibility-poc) (collector, cluster-free E2E, runsc path)
