@@ -104,7 +104,7 @@ list changed shape.
 |---|---|
 | `executeCodeBlocks: true` on `Agent` (its highest-severity control, 9/9) | **The field does not exist anywhere in the CRDs.** Sandboxed execution posture is now expressed as `Agent.spec.sandbox.network.allowedDomains`, which denies egress by default when unset or empty |
 | An `MCPServer` CRD | **No such CRD.** The two live resources are `RemoteMCPServer` (an upstream URL) and `ToolServer` (a tool server config with `stdio` / `sse` / `streamableHttp` variants) |
-| `Agent` carries pod fields directly | Nested under `spec.byo.deployment.*` **and** `spec.declarative.deployment.*`, with the same shape repeated on `SandboxAgent` |
+| `Agent` carries pod fields directly | Nested under `spec.byo.*` **and** `spec.declarative.*`, with or without an intervening `deployment` level depending on the served version, and the same shape repeated on `SandboxAgent` — see the served-version matrix |
 | Four pod-security controls | Out of scope per the non-goal above — they duplicate existing workload controls |
 | — | Fields the document predates: `ModelConfig.spec.apiKeyPassthrough`, `tls.disableSystemCAs`, `spec.allowedNamespaces` (a Gateway-API-style object, not a list) |
 
@@ -182,6 +182,11 @@ the insecure one.
 `apiKeyPassthrough` and `apiKeySecret` are mutually exclusive under the CRD's own
 CEL validation, so the two branches cannot both fire on one object.
 
+On **`ModelConfig/v1alpha1`** the field is named **`apiKeySecretRef`**, not
+`apiKeySecret`, and there is no `apiKeyPassthrough` at all — so only the second
+branch applies there, reading a different path. That version's `provider` enum is
+also shorter. See the served-version matrix below.
+
 An unauthenticated `Ollama` endpoint is a real posture question, but it is a
 property of the endpoint rather than of this resource's credential handling, and
 `C-0313` already covers the plaintext-transport half of it. Left out deliberately
@@ -197,6 +202,9 @@ the CRD's CEL requires it to be accompanied by *either* a `caCertSecretRef` *or*
 `caCertSecretRef` case is a legitimate strict-trust configuration and passes; the
 `disableVerify` case is already caught by this control's main branch.
 
+`ModelConfig/v1alpha1` has no `tls` field, so this control matches only `v1alpha2`
+and `v1alpha3` of that kind.
+
 **`kagent-inline-credentials` → `C-0312`**
 Credential material must be referenced, not embedded. Fails on:
 - `RemoteMCPServer.spec.headersFrom[].value` set where `.valueFrom` should be used,
@@ -208,17 +216,33 @@ Credential material must be referenced, not embedded. Fails on:
 - `deployment.env[].value` matching credential-name patterns, on both the `byo` and
   `declarative` paths.
 
-This is the one rule in scope that touches the dual deployment paths, and it
-handles them through a shared path list rather than a duplicated rule body.
+This is the one rule in scope whose field paths differ between served versions —
+the `deployment` nesting level is present in some and absent in others, across four
+distinct shapes on `Agent` and `SandboxAgent`. It handles them through an explicit
+path list rather than a duplicated rule body or an assumed nesting depth. The four
+shapes are enumerated in the served-version matrix below, and each needs its own
+fixture.
 
 #### Tier B — the MCP trust boundary
 
 **`kagent-plaintext-upstream-endpoint` → `C-0313`**
-Fails when an upstream URL uses the `http://` scheme:
-`RemoteMCPServer.spec.url`, `ModelProviderConfig.spec.endpoint`, and the URL inside
-`ToolServer.spec.config.sse` / `.streamableHttp`. Agent traffic to an MCP server
-carries tool arguments and results — frequently the most sensitive content in the
-system — and to a model provider it carries prompts and credentials.
+Fails when an upstream URL uses the `http://` scheme. Agent traffic to an MCP
+server carries tool arguments and results — frequently the most sensitive content
+in the system — and to a model provider it carries prompts and credentials.
+
+The URL does not live in one place. Paths to cover:
+
+- `RemoteMCPServer.spec.url`
+- `ModelProviderConfig.spec.endpoint`
+- `ToolServer.spec.config.sse.url`, `ToolServer.spec.config.streamableHttp.url`
+- `ModelConfig` **provider sub-objects**, which each carry their own base URL:
+  `openAI.baseUrl`, `azureOpenAI.azureEndpoint`, `foundry.endpoint`,
+  `sapAICore.baseUrl`, `sapAICore.authUrl`, `ollama.host`
+
+The `ModelConfig` paths were missing from an earlier draft of this proposal, which
+named only the first three bullets. A self-hosted or gateway-fronted model endpoint
+reached over plaintext is the same finding as a plaintext MCP server, and it is
+configured on a resource this control set already matches.
 
 **`kagent-mcp-server-unauthenticated` → `C-0314`**
 Fails when a `RemoteMCPServer` declares no authentication header in
@@ -232,7 +256,9 @@ happen. The alternative — inspecting mesh configuration from a CRD rule — is
 something Rego over a single object can do.
 
 **`kagent-cross-namespace-reference-scope` → `C-0315`**
-Fails when `spec.allowedNamespaces.from == "All"` on `Agent` or `RemoteMCPServer`.
+Fails when `spec.allowedNamespaces.from == "All"` on `Agent`, **`SandboxAgent`**
+or `RemoteMCPServer`. `SandboxAgent` embeds the same spec shape and carries the
+field in both its served versions; `Agent` carries it in `v1alpha2` only.
 
 `allowedNamespaces` follows the Gateway API cross-namespace attachment pattern: it
 is an **object**, not a list, with `from` taking `All`, `Same`, or `Selector`, and
@@ -261,8 +287,9 @@ These are the rules that describe the actual agent trust boundary, and each
 requires the proposal to take a position on what the secure default is.
 
 **`kagent-sandbox-egress-allowlist` → `C-0316`**
-`Agent.spec.sandbox.network.allowedDomains` governs what sandboxed execution may
-contact. The API denies egress by default when the field is unset or empty, so
+`spec.sandbox.network.allowedDomains` on `Agent` and **`SandboxAgent`** governs
+what sandboxed execution may contact. The field is identical in all three served
+shapes that have it; `Agent/v1alpha1` has no `sandbox` block. The API denies egress by default when the field is unset or empty, so
 **absence is a pass** — the failure mode is a permissive allowlist. Fails on `*`,
 on a bare-TLD wildcard (`*.com`, `*.io`), and on `*.` entries broad enough to be
 equivalent to open egress. Named domains and specific subdomain wildcards pass.
@@ -279,21 +306,77 @@ model-selected arguments — a local execution path where the `sse` and
 exist, which is why this is a control to justify rather than a hard failure; the
 remediation text says so.
 
-### Two hazards specific to these CRDs
+### The served-version matrix
 
-**Multi-version `match` blocks.** `ModelConfig` serves `v1alpha1`, `v1alpha2` and
-`v1alpha3`; `RemoteMCPServer` serves `v1alpha2` and `v1alpha3`; `ToolServer` serves
-`v1alpha1` only. Every `rule.metadata.json` `match` entry must list all served
-versions of the resource it targets. A rule matching only the newest version
-silently never fires on a cluster storing an older one, and nothing in the test
-harness catches that — the fixtures are what the test feeds the rule, not what the
-match block selects.
+This is the single largest false-negative risk in the whole design, and an earlier
+draft of this proposal got it wrong twice. Two facts drive everything below:
 
-**Dual deployment paths.** Anything reading pod-shaped fields must read both
-`spec.byo.deployment.*` and `spec.declarative.deployment.*`, and the identical
-shape on `SandboxAgent`. Within this proposal's scope only `C-0312` is affected,
-but the helper it introduces is the pattern for any later work that crosses into
-the deployment block.
+1. **A rule fires only on the kinds and versions its `match` block names.** A rule
+   matching only the newest version silently never fires on a cluster storing an
+   older one, and **nothing in the test harness catches that** — fixtures exercise
+   the rule body, not the match block. A missing version is invisible until an
+   audit misses a real misconfiguration.
+2. **These are alpha APIs whose field paths move between versions.** The same
+   logical field lives at a different path, under a different name, or not at all
+   depending on the version served.
+
+#### Served versions, per kind
+
+| Kind | Served versions |
+|---|---|
+| `Agent` | `v1alpha1`, `v1alpha2` |
+| `SandboxAgent` | `v1alpha2`, `v1alpha3` |
+| `ModelConfig` | `v1alpha1`, `v1alpha2`, `v1alpha3` |
+| `RemoteMCPServer` | `v1alpha2`, `v1alpha3` |
+| `ModelProviderConfig` | `v1alpha2`, `v1alpha3` |
+| `ToolServer` | `v1alpha1` |
+
+Note that **`Agent` does not serve `v1alpha3`** and `SandboxAgent` does not serve
+`v1alpha1`. The two kinds overlap only at `v1alpha2`.
+
+#### Per-control kind × version coverage
+
+Every `match` block must be written from this table, not from the newest schema.
+
+| Control | Kinds × versions to match | Version-specific notes |
+|---|---|---|
+| `C-0310` | `ModelConfig` v1alpha1, v1alpha2, v1alpha3 | **v1alpha1 names the field `apiKeySecretRef`, not `apiKeySecret`**, and has no `apiKeyPassthrough` — the passthrough branch cannot fire there. Its `provider` enum is also shorter (7 values, no `Bedrock`/`Foundry`/`SAPAICore`), so the ambient-identity set on v1alpha1 is only `GeminiVertexAI`, `AnthropicVertexAI`, `Ollama` |
+| `C-0311` | `ModelConfig` **v1alpha2, v1alpha3 only**; `RemoteMCPServer` v1alpha2, v1alpha3 | `ModelConfig/v1alpha1` has no `tls` field at all. Matching it would be harmless but meaningless; a fixture asserting a verdict on it would be testing nothing |
+| `C-0312` | `Agent` v1alpha1, v1alpha2; `SandboxAgent` v1alpha2, v1alpha3; `RemoteMCPServer` v1alpha2, v1alpha3; `ToolServer` v1alpha1 | Four distinct env path shapes — see below |
+| `C-0313` | `RemoteMCPServer` v1alpha2, v1alpha3; `ModelProviderConfig` v1alpha2, v1alpha3; `ToolServer` v1alpha1; `ModelConfig` all three | |
+| `C-0314` | `RemoteMCPServer` v1alpha2, v1alpha3 | |
+| `C-0315` | `Agent` **v1alpha2 only**; `SandboxAgent` v1alpha2, v1alpha3; `RemoteMCPServer` v1alpha2, v1alpha3 | **`Agent/v1alpha1` has no `allowedNamespaces` field** — the cross-namespace attachment pattern was introduced in v1alpha2 |
+| `C-0316` | `Agent` **v1alpha2 only**; `SandboxAgent` v1alpha2, v1alpha3 | `Agent/v1alpha1` has no `sandbox` block. `sandbox.network.allowedDomains` is identical across all three shapes that do have it |
+| `C-0317` | `ToolServer` v1alpha1 | Single served version; the only rule with no version fan-out |
+
+`SandboxAgent` embeds the same agent spec shape as `Agent`, including
+`allowedNamespaces` and `sandbox.network.allowedDomains`. **Any rule naming `Agent`
+must justify why it does not also name `SandboxAgent`**, and in this control set
+only `C-0312` differs between them — by path, not by presence.
+
+#### The four env path shapes for `C-0312`
+
+The `deployment` nesting level exists in some versions and not others, so there is
+no single path expression that covers all four:
+
+| Kind / version | Inline env paths |
+|---|---|
+| `Agent/v1alpha1` | `spec.deployment.env` |
+| `Agent/v1alpha2` | `spec.declarative.deployment.env`, `spec.byo.deployment.env` |
+| `SandboxAgent/v1alpha2` | `spec.declarative.deployment.env`, `spec.byo.deployment.env` |
+| `SandboxAgent/v1alpha3` | `spec.declarative.env`, `spec.byo.env` — the `deployment` level is **gone**, and `imageRegistry` moves up with it |
+
+An implementation that reads only the `.deployment.env` shape — as an earlier draft
+of this document described — misses inline credentials on two of the four served
+shapes. The rule therefore iterates an explicit path list rather than assuming a
+nesting depth.
+
+`C-0312` additionally covers, on the same resources:
+`RemoteMCPServer.spec.headersFrom[].value`,
+`ToolServer.spec.config.{sse,streamableHttp}.headers`,
+`ToolServer.spec.config.stdio.env`, and
+`ModelConfig.spec.azureOpenAI.azureAdToken` — an inline token field on the provider
+sub-object.
 
 ### Controls
 
@@ -353,6 +436,33 @@ API-key provider without `apiKeySecret` (fail), a `Bedrock` or `Foundry` config
 without one (pass), and an `apiKeyPassthrough: true` case (fail regardless of
 provider).
 
+### Fixtures per served shape, not per rule
+
+A fixture set that covers only the newest schema is the single easiest way to ship
+a rule with a silent false negative, because **the match block is untested**: the
+harness feeds the rule body an object directly, so a rule that would never be
+selected on a real cluster still passes its unit tests. The version matrix is
+therefore a fixture requirement, not just implementation guidance.
+
+Each rule needs at least one fixture **per distinct shape** in its row of the
+per-control coverage table:
+
+- **`C-0312` — four env fixtures minimum**, one per path shape:
+  `Agent/v1alpha1` (`spec.deployment.env`), the v1alpha2 shape
+  (`spec.{declarative,byo}.deployment.env`), and `SandboxAgent/v1alpha3`
+  (`spec.{declarative,byo}.env`), plus the `RemoteMCPServer`, `ToolServer` and
+  `azureAdToken` paths.
+- **`C-0310` — both field names**: `apiKeySecret` on v1alpha2/v1alpha3 and
+  `apiKeySecretRef` on v1alpha1.
+- **`C-0315` and `C-0316` — a `SandboxAgent` fixture each**, not only an `Agent`
+  one, since the resources share the field and differ only in kind.
+
+Where a kind/version genuinely lacks the field a rule targets — `Agent/v1alpha1`
+for `C-0315` and `C-0316`, `ModelConfig/v1alpha1` for `C-0311` — the correct
+treatment is to leave it out of the match block, and to note it in the control's
+`long_description` so a later reader does not "fix" the omission by adding a
+version where the rule can only ever pass vacuously.
+
 ### End to end
 
 1. kind cluster, Kagent installed from its Helm chart.
@@ -396,7 +506,7 @@ expected to fail.
 These are true positives, not rules to tune away: the chart's defaults are
 permissive, which is the same observation the 2025 document made about empty
 security contexts and disabled NetworkPolicies. The in-cluster plaintext URL is the
-most arguable of the three — see the false-positive note under `C-0314` — and is
+most arguable of the two — see the false-positive note under `C-0314` — and is
 the one most likely to end in a documented risk acceptance rather than a chart
 change.
 
@@ -500,3 +610,49 @@ Recorded so reviewers can see what moved rather than re-reading the whole docume
 The served-version matrix and the absence of `executeCodeBlocks` from all ten CRDs
 were independently verified in review against live schemas on a kind cluster, and
 both hold as documented.
+
+### Round two
+
+One further blocker: the served-version matrix omitted `Agent` and `SandboxAgent`
+entirely, which is the same class of error as round one — reasoning from the newest
+schema instead of enumerating what the API actually serves. Every claim below was
+verified against the shipped CRDs.
+
+- **`Agent` serves `v1alpha1` and `v1alpha2` only; `SandboxAgent` serves `v1alpha2`
+  and `v1alpha3`.** The two kinds overlap only at `v1alpha2`, and an earlier draft
+  of this document described `Agent` as though it served `v1alpha3`.
+- **`C-0312` has four env path shapes, not one.** `spec.deployment.env` on
+  `Agent/v1alpha1`; `spec.{declarative,byo}.deployment.env` on the v1alpha2 shape;
+  `spec.{declarative,byo}.env` on `SandboxAgent/v1alpha3`, where the `deployment`
+  nesting level disappears. The previous text named only the middle shape, so an
+  implementation following it would have missed inline credentials on half the
+  served shapes.
+- **`C-0315` and `C-0316` now name `SandboxAgent`.** It embeds the same spec shape
+  including `allowedNamespaces` and `sandbox.network.allowedDomains`, so naming
+  only `Agent` skipped two served resources carrying the same insecure values.
+
+Three further faults of the same class, found while building the matrix and not
+raised in review:
+
+- **`ModelConfig/v1alpha1` names the field `apiKeySecretRef`, not `apiKeySecret`**,
+  and has no `apiKeyPassthrough`. `C-0310` reads a different path there, and its
+  provider enum is seven values rather than ten.
+- **`ModelConfig/v1alpha1` has no `tls` field**, so `C-0311` must match only
+  `v1alpha2` and `v1alpha3` of that kind.
+- **`C-0313` was missing `ModelConfig`'s own endpoints.** Provider sub-objects each
+  carry a base URL (`openAI.baseUrl`, `azureOpenAI.azureEndpoint`,
+  `foundry.endpoint`, `sapAICore.baseUrl`/`authUrl`, `ollama.host`); a plaintext
+  model endpoint is the same finding as a plaintext MCP server. Also added
+  `azureOpenAI.azureAdToken` to `C-0312` as an inline-credential path.
+
+`Agent/v1alpha1` additionally has neither `allowedNamespaces` nor a `sandbox`
+block, so `C-0315` and `C-0316` deliberately exclude it rather than matching a
+version where they could only pass vacuously.
+
+The version matrix is now stated as a per-control kind × version table with the
+version-specific paths spelled out, and fixtures are required per served shape
+rather than per rule — since a rule whose match block omits a version still passes
+its unit tests, that requirement is the only thing standing between this design and
+a silent false negative.
+
+Also fixed the "three"/"two" default-install typo.
