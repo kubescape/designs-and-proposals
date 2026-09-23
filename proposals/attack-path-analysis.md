@@ -3,7 +3,7 @@
 - **Status:** Draft – discussion
 - **Author:** Mohit ([@mohityadav8](https://github.com/mohityadav8))
 - **Date:** 2026-09-19
-- **Scope:** [`kubescape`](https://github.com/kubescape/kubescape) CLI (`core/pkg/*`, `cmd/scan`, `printer`)
+- **Scope:** [`kubescape`](https://github.com/kubescape/kubescape) CLI (`core/pkg/*`, `cmd/scan`, `core/pkg/resultshandling/printer`)
 - **Related work:** [`vex-ingestion`](./vex-ingestion.md), [`evidence-of-finding`](./evidence-of-finding.md), [`repository-scan-contracts`](./repository-scan-contracts.md)
 
 ## 1. Summary
@@ -114,7 +114,18 @@ type Edge struct {
 
 `Certain` is load-bearing. The engines deliberately return `Unknown`, `unclear` and `Truncated` in places (a named container port, an IP-block peer, a cross-namespace route reference, a search that hit its safety bound). The path layer must **propagate** that uncertainty and never silently promote it to "reachable" or demote it to "safe".
 
-### 3.5 CLI surface
+### 3.5 Evaluating the network hop
+
+`networkpolicy.IngressExposure` reports the widest source class a workload's rules admit (open, external-cidr, any-namespace, restricted). It is not a verdict for a specific upstream, so the Service → workload hop is evaluated against the **actual source of the exposure path**:
+
+| Exposure path | Source endpoint | Rule |
+|---|---|---|
+| Ingress / Gateway route | The ingress-controller pod | `Reaches(controllerEndpoint, workloadEndpoint)` when the controller can be identified in the collected resources; otherwise the edge is emitted with `Certain=false`. |
+| LoadBalancer / NodePort | An external IP | `IngressExposure ≥ ExposureExternalCIDR` gives `Certain=true`; anything narrower gives `Certain=false` (the engine already returns `Unknown` for `ipBlock` peers). |
+
+A workload restricted to the ingress-controller namespace must therefore be reported as reachable from the Internet through that Ingress, not as unreachable. In `--fail-on-path` CI runs the controller pod is usually not in the manifests, so those edges will typically be `Certain=false`; the gate must decide explicitly whether uncertain edges count (see §9).
+
+### 3.6 CLI surface
 
 ```bash
 kubescape scan attack-paths [flags]
@@ -134,7 +145,7 @@ Indicative flags (final set to be settled in review):
 
 Existing flags (`--include-namespaces`, `--exclude-namespaces`, `--kube-context`, `--hide`, `--encrypt`, `--exceptions`) are reused, not redefined. Local manifest scanning is supported, since the engines are static; `ipBlock` peers then remain `Unknown`, which is already their documented behaviour.
 
-### 3.6 Example output
+### 3.7 Example output
 
 ```
 PATH #1  score 9.6 (CRITICAL)
@@ -187,7 +198,7 @@ Because the output will be read as a statement about attack reachability, the im
 2. **Never drop an unresolved edge silently.** A workload whose pod template cannot be resolved, or a Service with no selector, is reported as skipped, not guessed (the existing `vulnexposure` `skipped` return sets this precedent).
 3. **Be deterministic** across runs.
 4. **Bound the search.** Enforce a depth limit and a path-count cap; when the cap is hit, set an explicit `truncated` flag rather than returning a partial list as if complete.
-5. **Have golden-file tests** covering: a fully resolved path, each engine's "unknown" outcome, `automountServiceAccountToken: false` at both pod and ServiceAccount level (no `runs-as` edge), a selector-less/headless Service (no backend edge), and each output format.
+5. **Have golden-file tests** covering: a fully resolved path; each engine's "unknown" outcome; `automountServiceAccountToken: false` at both pod and ServiceAccount level **and** no projected `serviceAccountToken` volume (no `runs-as` edge); `automountServiceAccountToken: false` **with** a projected `serviceAccountToken` volume (`runs-as` edge present, since the token is still mounted); a selector-less/headless Service (no backend edge); and each output format. The pod-level value overrides the ServiceAccount-level value.
 
 ## 8. Alternatives considered
 
@@ -211,7 +222,7 @@ Because the output will be read as a statement about attack reachability, the im
 
 - `kubescape/core/pkg/exposure`, `networkpolicy`, `rbacgraph`, `vulnexposure` (package comments document each engine's trust model and non-goals)
 - `kubescape/cmd/mcpserver` (current sole consumer of the four engines)
-- `kubescape/core/pkg/resourcesprioritization` and `printer/v2/attacktracks.go` (existing control-driven attack-track output)
+- `kubescape/core/pkg/resourcesprioritization` and `core/pkg/resultshandling/printer/v2/attacktracks.go` (existing control-driven attack-track output)
 - `kubescape/core/pkg/fleet` (existing multi-context rollup)
 - [`vex-ingestion`](./vex-ingestion.md), [`evidence-of-finding`](./evidence-of-finding.md) in this repository
 - PaloAltoNetworks `rbac-police` and `kubiscan`, cited in `rbacgraph`'s own package comment as the source of the RBAC escalation primitives
