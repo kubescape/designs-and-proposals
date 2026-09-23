@@ -121,9 +121,9 @@ type Edge struct {
 | Exposure path | Source endpoint | Rule |
 |---|---|---|
 | Ingress / Gateway route | The ingress-controller pod | `Reaches(controllerEndpoint, workloadEndpoint)` when the controller can be identified in the collected resources; otherwise the edge is emitted with `Certain=false`. |
-| LoadBalancer / NodePort | An external IP | `IngressExposure ≥ ExposureExternalCIDR` gives `Certain=true`; anything narrower gives `Certain=false` (the engine already returns `Unknown` for `ipBlock` peers). |
+| LoadBalancer / NodePort | An external IP | Evaluated through `Reaches` against the actual external endpoint and the Service's translated target port when both are known, giving `Certain=true`/`false` per that verdict; when the endpoint or port is not known, the edge falls back to `Certain=false` rather than a source-class shortcut. A broad `IngressExposure` class (e.g. `ExposureExternalCIDR`) is not by itself sufficient for `Certain=true`, since it ignores rule ports and treats every `ipBlock` as external regardless of CIDR/`except` membership. |
 
-A workload restricted to the ingress-controller namespace must therefore be reported as reachable from the Internet through that Ingress, not as unreachable. In `--fail-on-path` CI runs the controller pod is usually not in the manifests, so those edges will typically be `Certain=false`; the gate must decide explicitly whether uncertain edges count (see §9).
+A workload restricted to the ingress-controller namespace must therefore be reported as reachable from the Internet through that Ingress, not as unreachable. Likewise, a source class alone (e.g. `ExposureExternalCIDR`) must never establish a certain LB/NodePort path on its own; port and CIDR-exception details always take precedence when available. In `--fail-on-path` CI runs the controller pod is usually not in the manifests, and the LB/NodePort's true source endpoint is often unknown too, so most of these edges will be `Certain=false`; the gate must decide explicitly whether uncertain edges count (see §9).
 
 ### 3.6 CLI surface
 
@@ -155,8 +155,10 @@ PATH #1  score 9.6 (CRITICAL)
       runs as ServiceAccount shop/web-sa
           --(create pods + assign-serviceaccount)--> ServiceAccount kube-system/deployer
               --(bind verb)--> ClusterRole cluster-admin
-  ==> CLUSTER-ADMIN REACHABLE FROM INTERNET IN 3 HOPS
+  ==> CLUSTER-ADMIN REACHABLE FROM INTERNET IN 3 HOPS 
 ```
+
+  A hop is one edge between two nodes in the path; the example above has 6 edges. Final wording for the "N HOPS" summary line is to be settled in review.
 
 ## 4. Goals
 
@@ -211,7 +213,8 @@ Because the output will be read as a statement about attack reachability, the im
 
 - **Command name.** `attack-paths` vs `attack-graph` vs another. Needs a maintainer decision.
 - **Where should the shared pod-template resolver live?** Moving it out of `cmd/mcpserver` touches existing MCP code. Is a new `core/pkg/attackpath` package acceptable, or should it live next to `networkpolicy`?
-- **Vulnerability data dependency.** `vulnexposure` needs `VulnerabilityManifest` objects from an in-cluster scanner. Proposed behaviour is to degrade gracefully (paths still produced, CVE hops omitted, clearly stated). Is that acceptable?
+- **Vulnerability data dependency.** `vulnexposure` needs `VulnerabilityManifest` objects from an in-cluster scanner. Proposed behaviour: paths still appear without a CVE hop (exposed workload → ServiceAccount → cluster-admin), but score lower than an otherwise identical path with an RCE-class CVE, because there is no known entry vector. The output states clearly when CVE data was unavailable. Is that acceptable?
+- **Uncertain edges and `--fail-on-path`.** Should a path containing `Certain=false` edges trip the CI gate by default, or only with an opt-in flag such as `--fail-on-uncertain`?
 - **Interaction with VEX ingestion.** If [`vex-ingestion`](./vex-ingestion.md) lands, vendor `not_affected` statements would suppress CVEs before they reach this layer. This proposal reads whatever the vulnerability manifests contain, so it should benefit automatically, but the provenance of suppressed findings needs a decision (should a suppressed CVE appear as a de-emphasised hop, or not at all?).
 - **Scoring.** Which factors and weights? Proposed starting factors: maximum CVE severity on the path, fix availability, exposure level, hop count, sink type, edge certainty. The formula should be documented and its factors emitted in JSON so the ranking is auditable.
 - **Path explosion.** What default depth and path-count caps are reasonable for large clusters, given the known cost concerns in `docs/optimization-plan.md`?
