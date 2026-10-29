@@ -26,8 +26,9 @@ never weaker than today.
 
 Workloads that don't run at all hours (for example, scaled to zero at night) can't have every time
 of day watched, so they don't complete through this rule. For them, the per-workload
-`kubescape.io/max-sniffing-time` label is the right tool, and it loses nothing, because the hours
-it skips are hours in which the workload isn't running.
+`kubescape.io/max-sniffing-time` label is the right tool. It is a trade-off: the night costs
+nothing, since the workload doesn't run then, but a learning period shorter than the daily run
+leaves the end of that run unobserved.
 
 ## Motivation
 
@@ -51,8 +52,9 @@ day, give or take one quarter-hour (the resolution of the analysis); one had a 4
 exactly the workloads this proposal targets.
 
 The stage workloads only run 06:00–20:00 UTC. No rule based on observation can watch them at 03:00.
-The user can set the learning period to match their daily uptime instead (e.g. `12h`), which is
-what they are already being advised to do.
+The user can set the learning period close to their daily uptime instead (e.g. `13h` for a 14h
+run), which is what they are already being advised to do. Behavior in the last part of the daily
+run (here the final hour) is then not observed.
 
 **Summing** learned time across containers until it reaches 24h would complete both kinds, but
 that loses the daily-cycle guarantee. In the same data, all 31 stage ReplicaSets whose summed
@@ -236,7 +238,9 @@ Whichever path comes first completes the profile. Coverage only applies while th
    - `kubescape.io/coverage-ratio`: the share of the day in `Learned`, e.g. `0.93`. It reports
      daily coverage only;
    - `kubescape.io/learning-progress`: the progress consumers should show for a profile in
-     `learning`, defined so that it reaches `1.0` only when the coverage rule is met:
+     `learning`, defined so that it reaches `1.0` only when the coverage rule is met. It is the
+     value below, capped at `0.99` while condition 2 (a received full start-up observation) isn't
+     met, in which case `kubescape.io/learning-waiting-for: startup` says why:
      - `T = 24h`: `coverage-ratio`;
      - `T > 24h`: `min(coverage-ratio, learnedSeconds / T)`, because condition 3 still needs the
        learned-time union to reach `T` after the day is covered (with `T = 48h`, coverage can be
@@ -332,9 +336,11 @@ What it does **not** guarantee, same as today:
 - **Single long-lived container.** Its segment covers the whole day just as its 24h timer fires,
   so it completes as today, through whichever path runs first.
 - **Nightly scale-to-zero (06:00–20:00 UTC up).** `Learned` never covers 20:00–06:00, so coverage
-  never completes it. It behaves as today, and the user sets
-  `kubescape.io/max-sniffing-time: "12h"` on its pod template. That loses nothing, because the
-  workload doesn't run during the hours it skips.
+  never completes it. It behaves as today, and the user sets `kubescape.io/max-sniffing-time` on
+  its pod template. With `13h`, a container watched from 06:00 completes at 19:00. The night is no
+  loss, since nothing runs then, but 19:00–20:00 is not observed, so a daily job at 19:30 would be
+  missed. A value closer to the full 14h shrinks that gap, but must stay reliably below the real
+  daily uptime, or learning never completes.
 
 ## Guidance for workloads that don't run at all hours
 
@@ -343,9 +349,12 @@ Documentation should state plainly:
 - Coverage completion needs the workload to be running (and watched) at every time of day. Always-on
   workloads get it automatically, however often their containers churn.
 - Workloads that are scaled to zero on a schedule, or run only part of the day, should set
-  `kubescape.io/max-sniffing-time` on their pod template to a value that fits within one daily run,
-  e.g. `12h` for a 06:00–20:00 schedule. Setting the label changes the pod template, so it triggers
-  one rollout and learning starts once more from there.
+  `kubescape.io/max-sniffing-time` on their pod template to a value as close as possible to one
+  daily run, but reliably below it: e.g. `13h` for a 06:00–20:00 schedule. This is a trade-off:
+  behavior in the part of the run after the learning period (here 19:00–20:00) isn't observed, so
+  jobs scheduled late in the daily run should be considered when choosing the value. Setting the
+  label changes the pod template, so it triggers one rollout and learning starts once more from
+  there.
 - `kubescape.io/coverage-ratio` shows how much of the day has been watched, which makes it easy to
   spot workloads stuck below `1.0` because they don't run around the clock.
 - Workloads whose behavior depends on container uptime rather than time of day can keep today's
@@ -387,8 +396,9 @@ Documentation should state plainly:
    - a settle delay before trusting vacancy, and a reconciliation window for late evidence.
 
    Rejected for now: a large amount of machinery and watch load, to automate something that the
-   owners of a scale-to-zero schedule can express with one label, at no loss. It can be revisited
-   as an extension if label tuning proves impractical.
+   owners of a scale-to-zero schedule can approximate with one label. The label costs only the
+   end of the daily run that falls after the learning period. It can be revisited as an extension
+   if label tuning proves impractical or that cost proves too high.
 3. **node-agent shortens its learning timer from storage-published coverage.** Rejected: to be safe
    it needed a new final status, a freshness check, a completion cutoff with dated evidence, and a
    timer floor, and a container stopped early couldn't recover if storage then rejected the
@@ -426,7 +436,8 @@ Documentation should state plainly:
   - lossy periods (`events-dropped`) excluded from `Learned`, and a lossy initial report failing
     condition 2;
   - `learning-progress` for `T = 24h`, `T = 48h` (full coverage, half progress) and `T < 24h`
-    (not set), and the `learning-coverage: disabled` opt-out;
+    (not set), the `0.99` cap with `learning-waiting-for: startup` when only late-started series
+    cover the day, and the `learning-coverage: disabled` opt-out;
   - the `Learned` set: projection across midnight, exact millisecond bounds with no padding, the
     interval cap;
   - effective `T`: frozen on first sight, raised on conflicting labels, unknown without the label;
