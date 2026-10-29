@@ -217,8 +217,16 @@ therefore extend one 30-minute segment instead of producing three disjoint fragm
 
 ### Completion rule
 
-For a profile key in status `learning` whose effective learning period `T` (from the chunks'
-learning-period label) is at least 24h, storage completes the profile when:
+**Effective `T`.** Every chunk carries the effective learning period as the learning-period label.
+storage records it per profile key the first time it sees it, and **freezes** it. Chunks of one
+profile key normally agree, because the pod-label override is part of the pod template, and a new
+template means a new profile key. They can disagree only if `maxSniffingTimePerContainer` changes
+cluster-wide while a profile is learning. storage then keeps the **largest** value seen (more
+evidence required, never less) and doesn't lower it. If no chunk of the profile key carries the
+label (older node-agent), `T` is unknown and coverage completion doesn't apply to that profile.
+
+For a profile key in status `learning` whose frozen effective `T` is at least 24h, storage
+completes the profile when:
 
 1. `Covered` is the whole day `[00:00, 24:00)`, **and**
 2. at least one contributing series is a **received full observation**: completion `full`, **and**
@@ -230,9 +238,19 @@ learning-period label) is at least 24h, storage completes the profile when:
    at least `T`.
 
 Completing means setting the consolidated profile to `completed`/`full`, derived from these
-conditions rather than copied from any one series. The existing completion paths (a series
-completing after the full `T`, a clean exit, expiry) are unchanged. Whichever comes first
-completes the profile.
+conditions rather than copied from any one series.
+
+**Interaction with the existing completion paths.** These stay exactly as they are today:
+- a series that learned for the full `T` and ends `completed` completes the profile as today;
+- a clean exit (exit code 0) completes it with the series' own completion, as today;
+- expiry (no report for `2 × maxSniffingTime`) finalizes it as `completed`/`partial`, as today.
+
+Whichever path comes first completes the profile. Coverage evaluation only applies while the
+profile is `learning`, so once another path has completed it, coverage stops there. In
+particular, coverage does **not** promote a `completed`/`partial` profile to `full`. This is
+deliberate: the proposal adds a path to completion and doesn't change, gate or upgrade the existing
+ones (see Non-goals). Whether coverage should later be allowed to upgrade an expired
+`completed`/`partial` profile is an open question.
 
 ### Storage changes
 
@@ -250,6 +268,9 @@ completes the profile.
    - A node informer tracks the `Ready` condition. storage's ClusterRole already allows
      `get`/`watch`/`list` on pods; it needs `watch` on nodes in addition to `list`.
    - `spec.nodeName` links each attempt to its node, so that the node's `Ready` condition applies.
+   - Owner informers (ReplicaSets, StatefulSets, DaemonSets, Jobs; metadata only) give each workload
+     instance's creation and deletion times, which bound vacancy. storage's ClusterRole already
+     allows `get`/`watch`/`list` on all of them.
    - Informer gaps, not-`Ready` nodes, `restartCount` jumps greater than one, and attempts without
      an establishable start are recorded as `U`.
    - **Per-attempt provenance.** storage keeps one record per attempt (container ID, pod, node,
@@ -270,7 +291,21 @@ completes the profile.
      provisional bounds therefore never removes occupancy contributed by other attempts or by
      unknown periods;
    - once absolute time becomes settled, the projection of its known not-running part is added to
-     `Vacant`.
+     `Vacant` (constructed as described next).
+
+   **Vacancy construction.** For a profile key, an absolute interval `[a, b]` is **known not
+   running** only if all of these hold:
+   - storage's pod informer was synced throughout `[a, b]`, and no `U` period of this profile key
+     overlaps it;
+   - the workload instance existed throughout `[a, b]`: after its owner object's
+     `creationTimestamp` (taken from the informer that watches that kind), and before its deletion.
+     Time before the instance was created, or after it was deleted, is not evidence about it, and
+     is neither vacant nor occupied;
+   - every pod owned by the instance that existed at any moment of `[a, b]` is accounted for. A pod
+     before its container's attempt started, after that attempt's exit, or after the pod's deletion
+     **as observed by the synced informer** is known not running. A deletion that happened while the
+     informer wasn't watching falls under `U`;
+   - no attempt record of the profile key overlaps `[a, b]`.
 
    Only recent absolute-time evidence (segments and running intervals not yet projected and
    settled) needs to be kept, so storage doesn't keep an unbounded history.
@@ -450,7 +485,9 @@ What it does **not** guarantee, same as today:
 3. **Carry-over across ReplicaSets with an identical image.** A rollout that changes only
    configuration or labels currently resets learning. Should the evidence carry over when every
    container's image digest is unchanged?
-4. **Evidence aging.** `Occupied` is permanent, so one unobserved night can delay coverage
+4. **Upgrading expired profiles.** Should coverage be allowed to promote a profile that expiry
+   finalized as `completed`/`partial` to `completed`/`full` once `Covered` becomes full?
+5. **Evidence aging.** `Occupied` is permanent, so one unobserved night can delay coverage
    completion until today's rule kicks in. Should `Occupied` and `Vacant` evidence older than some
    window (e.g. 7 days) be dropped?
 
@@ -467,6 +504,10 @@ What it does **not** guarantee, same as today:
     interval cap;
   - the `Occupied` block on the vacancy path;
   - heartbeat chunks extend segments without being merged;
+  - effective `T`: frozen on first sight, raised on conflicting labels, unknown without the label;
+  - vacancy construction before the first pod, after pod deletion, and before the owner existed;
+  - existing completion paths (full `T`, clean exit, expiry) winning before coverage, with no
+    promotion of `completed`/`partial`;
   - completion: the three conditions, `T < 24h` and non-`learning` profiles left alone,
     `completed`/`full` derivation, and rejection of later reports via `PreSave`;
   - chunks from old node-agents without `learning-start`.
