@@ -128,7 +128,10 @@ ReplicaSet, StatefulSet, DaemonSet or Job, plus container name), storage collect
 
 Evidence about an absolute time `t` is **settled** once the informer has been continuously synced
 from `t` until now and `now - t` exceeds a settle delay (e.g. 10 minutes, well above kubelet's
-status-update latency). `R` and `U` are only used for settled time.
+status-update latency). Settling is asymmetric. Evidence that the container **ran**, or that its
+state was unknown, is used immediately, because it can only make the result more conservative.
+Evidence that it **did not run** is used only once settled, because a status update still in flight
+could contradict it.
 
 From the evidence, storage maintains three **time-of-day sets**, each a list of disjoint intervals
 over `[00:00, 24:00)` with millisecond endpoints:
@@ -136,7 +139,7 @@ over `[00:00, 24:00)` with millisecond endpoints:
 | Set | Contains time of day `τ` when, on some day, … | Rounding |
 |---|---|---|
 | `Learned` | some container of the profile key was inside a learning segment at `τ` (projection of `L`). | inward |
-| `Occupied` | the container was running, or its state unknown, at `τ` (projection of settled `R ∪ U`). | outward |
+| `Occupied` | the container was running, or its state unknown, at `τ` (projection of `R ∪ U`, used immediately). | outward |
 | `Vacant` | the state was settled and known, and the container was not running at `τ`. | inward |
 
 The time of day that is **covered** is
@@ -151,7 +154,14 @@ at least once.
 
 Every set is a union over days, so it only grows. `Learned` does not depend on `R` at all, so
 running evidence that arrives late can never invalidate it. Late evidence can only grow `Occupied`,
-which can only shrink `Covered`, and the completion gate re-evaluates `Covered` when it runs. The
+which can only shrink `Covered`, and the completion gate re-evaluates `Covered` when it runs.
+
+When the gate runs, the not-yet-settled window `[now - settle delay, now]` is also treated as
+occupied (`Occupied_gate = Occupied ∪ projection of the unsettled window`). So vacancy seen on an
+older day can't cover a time of day at which the workload may have just run, before its pod status
+reached storage. Recent times of day are covered only through `Learned`. The container whose final
+report triggers the gate was being watched up to that moment, so in the normal case those times
+are in `Learned`. The
 sets are bounded: past a cap (e.g. 512 intervals), `Occupied` merges its closest neighbors (it can
 only grow), and `Learned` and `Vacant` drop their shortest intervals (they can only shrink). Either
 way the result is conservative.
@@ -200,8 +210,9 @@ and 00:30, say) extend one 30-minute segment instead of producing three disjoint
    are recorded as unknown.
 3. **Time-of-day evaluation.** storage keeps `R`, `U` and `L` in absolute time for a bounded
    look-back window (e.g. `2 × T`) in its own metadata table. When a segment is extended, it adds
-   its projection to `Learned` straight away. Once absolute time becomes settled, it adds that
-   time's projections to `Occupied` and `Vacant`. Evidence that arrives late, for example the next
+   its projection to `Learned` straight away. When running or unknown evidence arrives, it adds its
+   projection to `Occupied` straight away. Once absolute time becomes settled, it adds the
+   projection of its known not-running part to `Vacant`. Evidence that arrives late, for example the next
    report of an idle container, still extends `Learned` for the time it now covers.
 4. **Learned-time union (only for `T > 24h`).** `L` is kept as a list of disjoint `[start, end)`
    ranges in the same metadata table. Overlapping or touching ranges are coalesced, so overlapping
@@ -256,13 +267,17 @@ and 00:30, say) extend one 30-minute segment instead of producing three disjoint
        timer = T                                   # it cannot satisfy condition 2
    else:
        uncovered = minutes of day not in covered
-       deadline  = end of the last uncovered minute, walking forward over the next 24h from the
-                   current minute (this container is learned from its watch start, so the
-                   current minute can be learned too)
+       deadline  = end of the last uncovered minute, walking forward over the next 24h through
+                   occurrences that start at or after watchStart. An uncovered minute that
+                   started before watchStart can't be fully watched today, so it maps to its
+                   next-day occurrence (12:34 with watchStart 12:34:30 counts as tomorrow's
+                   12:34; one that starts exactly at watchStart counts today)
        if uncovered is empty: deadline = now + floor   # floor: e.g. 2 × updateDataPeriod, to
                                                        # send at least one linked report
        if T > 24h: deadline = max(deadline, now + (T - learnedSeconds))
-       timer = min(deadline - now, T)              # never longer than today
+       timer = min(deadline - now, T)              # never longer than today; when the cap
+                                                   # applies the container ends with
+                                                   # `completed` after the full T
    final status on expiry = (timer < T) ? coverage-completed : completed
    ```
 
@@ -403,7 +418,8 @@ What it does **not** guarantee, same as today:
 - **storage unit tests**:
   - segment construction across consolidation passes, split rows and broken links;
   - time-of-day set evaluation (fragments inside a minute, transitions, terminating pods, informer
-    gaps, the settle delay, late `L` and late `R` evidence, the interval cap);
+    gaps, the asymmetric settle delay, late `L` and late `R` evidence, the interval cap);
+  - the gate treating the unsettled window as occupied;
   - the `Occupied` block on the vacancy path;
   - the completion gate for `coverage-completed`, other final statuses and legacy reports, and the
     aggregate `completed`/`full` derivation for a `partial` final series;
@@ -411,7 +427,8 @@ What it does **not** guarantee, same as today:
 - **Downgrade test**: a `coverage-completed` report sent to storage without this proposal leaves
   the profile `learning`.
 - **node-agent unit tests**: timer computation, table-driven over `covered-minutes`, current time, `T`
-  and full/partial cases, plus the old-storage fallback.
+  and full/partial cases, including an uncovered minute already in progress at watch start, plus
+  the old-storage fallback.
 - **Component test**: a Deployment scaled 1→0→1 on a short schedule, with an artificially shortened
   day (minute length and day length configurable in tests). The profile must complete only after
   the zero-replica window has been recorded as vacant, and must not complete if a replica ran
