@@ -127,7 +127,8 @@ ReplicaSet, StatefulSet, DaemonSet or Job, plus container name), storage collect
   container ID (`containerStatuses[].containerID`, which changes on every restart).
   - For an attempt node-agent watched, the interval is exactly the lifetime node-agent reports
     (see "node-agent changes"), matched by container ID: from `kubescape.io/container-started-at`
-    to `kubescape.io/container-ended-at`, or still open.
+    to `kubescape.io/container-exited-at` (or, without a verified exit time, to when node-agent
+    observed the exit), or still open.
   - For any other attempt, it comes from `containerStatuses` (`state.running.startedAt`,
     `state.terminated.startedAt`/`finishedAt`, `lastState`). Those timestamps have one-second
     precision, so these intervals are rounded **outward** to whole seconds.
@@ -159,14 +160,16 @@ disjoint intervals over `[00:00, 24:00)` with millisecond endpoints:
 | Set | Contains time of day `τ` when, on some day, … | Rounding |
 |---|---|---|
 | `Learned` | some container of the profile key was inside a learning segment at `τ` (projection of `L`). | inward, never padded |
-| `Occupied` | the container was running, or its state unknown, at `τ` (projection of `R ∪ U`, used immediately). | outward |
+| `Occupied` | the container was running, or its state unknown, at `τ` (projection of final attempts and `U`; provisional attempts count immediately through `Occupied_eval`). | outward |
 | `Vacant` | the state was settled and known, and the container was not running at `τ`. | inward |
 
 The time of day that is **covered** is
 
 ```
 Covered = Learned ∪ (Vacant \ Occupied_eval)
-Occupied_eval = Occupied ∪ projection of [now - settle delay, now]
+Occupied_eval = Occupied
+              ∪ projection of provisional and still-running attempts
+              ∪ projection of [now - settle delay, now]
 ```
 
 So a time of day is covered either because the workload was watched at that exact time on some
@@ -195,10 +198,14 @@ A **learning segment** is a maximal interval during which one series is verifiab
 - After a broken link, it starts at the `ReportTimestamp` of the first report after the gap: data
   between a missing report and its successor is lost, so that time isn't credited.
 - It is extended to the `ReportTimestamp` of every report that links to its predecessor.
-- When a series ends with its container's exit, its final report carries
-  `kubescape.io/container-ended-at`: the time node-agent observed the exit, which is at or after the
-  actual exit. node-agent watched the container until then, so the last segment ends there. The
-  attempt's running interval ends at the same timestamp, so no unlearned sliver is left at exit.
+- When a series ends with its container's exit, the last segment ends at the **verified runtime
+  exit time** (`kubescape.io/container-exited-at`), not when node-agent handled the exit
+  notification. After the exit nothing was running in that container, so `Learned` must not cover
+  that time, where another day's unobserved run could fall. The attempt's running interval ends at
+  the same timestamp, so no unlearned sliver is left at exit. If no verified exit time is available,
+  the segment ends at the last report sent **before** the exit. The attempt's running interval then
+  extends to when node-agent observed the exit (`kubescape.io/exit-observed-at`), so the uncertain
+  tail counts as occupied but not learned.
 - Segment bounds are always node-agent's verified observation bounds. They are never rounded or
   padded. If the lifetime annotations are missing (older node-agent), the segment starts at the
   first report and ends at the last report, and the uncertain edges stay uncovered.
@@ -235,19 +242,30 @@ completes the profile.
    (`kubescape.io/heartbeat: "true"`, see "node-agent changes") extends the segment like any linked
    report. Its row is recorded with `hasData=false` and its payload is not stored or merged, since
    it carries no new behavior.
-2. **Running intervals.** A pod informer (one per cluster, metadata and `status.containerStatuses`
-   only) records container attempts per workload instance and container name. It uses each pod's
+2. **Running intervals.** A pod informer (one per cluster, keeping only metadata, `spec.nodeName`
+   and `status.containerStatuses`) records container attempts per workload instance and container name. It uses each pod's
    `ownerReferences` to find the instance, and works the same way for ReplicaSets, StatefulSets,
    DaemonSets and Jobs, including terminating pods.
    - Attempts with a matching series (by container ID) take node-agent's lifetime bounds; all others
      take outward-rounded pod-status times.
    - A node informer tracks the `Ready` condition. storage's ClusterRole already allows
      `get`/`watch`/`list` on pods; it needs `watch` on nodes in addition to `list`.
+   - `spec.nodeName` links each attempt to its node, so that the node's `Ready` condition applies.
    - Informer gaps, not-`Ready` nodes, `restartCount` jumps greater than one, and attempts without
      an establishable start are recorded as `U`.
+   - **Per-attempt provenance.** storage keeps one record per attempt (container ID, pod, node,
+     bounds, and whether the bounds are provisional or exact). An attempt first seen in pod status
+     has **provisional** outward-rounded bounds. When its matching series arrives, they are replaced
+     by node-agent's exact bounds. An attempt is **final** once it has exact bounds and has ended,
+     or once it is clearly unwatched: no matching series arrived within `initialDelay` plus the
+     settle delay of its start, so its rounded bounds stand. Only final attempts are projected into
+     the grow-only `Occupied` set. Provisional and running attempts count as occupied during
+     evaluation only (`Occupied_eval`), so a rounded prefix such as `06:00:20.000–06:00:20.412` is
+     never committed for an attempt that turns out to be watched.
 3. **Time-of-day sets.** storage keeps the three sets per profile key in its own metadata table:
    - when a segment is extended, its projection is added to `Learned`;
-   - when running or unknown evidence arrives, its projection is added to `Occupied`;
+   - when an attempt becomes final, or an unknown period is recorded, its projection is added to
+     `Occupied`;
    - once absolute time becomes settled, the projection of its known not-running part is added to
      `Vacant`.
 
@@ -282,8 +300,11 @@ completes the profile.
      (`Runtime.ContainerStartedAt`, which node-agent already uses to tell pre-running containers
      apart).
 
-   On the final report after an exit, also add `kubescape.io/container-ended-at`: when node-agent
-   observed the exit.
+   On the final report after an exit, also add:
+   - `kubescape.io/container-exited-at`: the **verified** exit time from the container runtime (the
+     CRI `ContainerStatus.finished_at`, nanosecond precision), when node-agent can obtain it;
+   - `kubescape.io/exit-observed-at`: when node-agent handled the exit notification. This is used
+     only as an upper bound for occupancy, never for `Learned`.
 
    storage can't derive these on its own. A chunk identifies the workload instance and container
    name, but not the pod or the attempt, and pod-status timestamps are only precise to the second.
@@ -339,10 +360,11 @@ What it does **not** guarantee, same as today:
 ### Worked examples
 
 - **Nightly scale-to-zero (06:00–20:00 UTC up), pod informer synced throughout.**
-  - Day 1: a container starts at 06:00:20.412, is watched for its whole life, and node-agent
-    observes its exit at 20:00:05.630. Its running interval and its learning segment are both
-    06:00:20.412–20:00:05.630, so `Learned` and `Occupied` get exactly that. Nothing runs
-    overnight, so as the night settles, 20:00:05.630 onwards goes into `Vacant` and never into
+  - Day 1: a container starts at 06:00:20.412, is watched for its whole life, and the runtime
+    reports its exit at 20:00:05.630. Its running interval and its learning segment are both
+    06:00:20.412–20:00:05.630, so `Learned` and `Occupied` get exactly that. The rounded
+    pod-status bounds (06:00:20–20:00:06) were only provisional and are never committed. Nothing
+    runs overnight, so as the night settles, 20:00:05.630 onwards goes into `Vacant` and never into
     `Occupied`.
   - Day 2: a new container starts at 06:00:15 and is learned from there. By ~06:10:15 the night up
     to 06:00:15 has settled as vacant, so the whole day is covered. The next consolidation pass
@@ -415,8 +437,8 @@ What it does **not** guarantee, same as today:
 
 ## Open questions
 
-1. **Pod informer cost.** A cluster-wide pod informer in storage (status only, with a transform
-   that drops everything else) adds memory and apiserver watch load. Could node-agent provide the
+1. **Pod informer cost.** A cluster-wide pod informer in storage (with a transform that keeps
+   only metadata, `spec.nodeName` and `status.containerStatuses`) adds memory and apiserver watch load. Could node-agent provide the
    running intervals for the pods on its node instead? That would lose pods on nodes without a
    healthy node-agent, which the informer marks as running but unobserved.
 2. **Leader-elected jobs.** Should `Learned` require that *every* running replica was watched at a
@@ -446,7 +468,8 @@ What it does **not** guarantee, same as today:
     `completed`/`full` derivation, and rejection of later reports via `PreSave`;
   - chunks from old node-agents without `learning-start`.
 - **node-agent unit tests**: chunks carry `learning-start`, `container-id` and
-  `container-started-at`, and final reports after an exit carry `container-ended-at`; an idle learning
+  `container-started-at`, and final reports after an exit carry `container-exited-at` (when the runtime provides it) and
+  `exit-observed-at`; an idle learning
   container sends a linked heartbeat after `learningHeartbeatInterval`, in the stitch shape, and
   stops sending them once learning stops.
 - **Component test**: a Deployment scaled 1→0→1 on a short schedule, with an artificially shortened
