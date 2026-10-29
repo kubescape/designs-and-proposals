@@ -426,10 +426,10 @@ What it does **not** guarantee, same as today:
   harmless on their own.
 - **Old node-agent + new storage:** chunks have no lifetime annotations, so series can't be matched
   to attempts. Every attempt takes outward-rounded pod-status times, and segments run from the first
-  report to the last. Every container start then leaves a gap of up to `initialDelay` (2 minutes by default)
-  that is never learned, and workloads that start at the same time every day won't complete through
-  coverage. They complete as today. Nothing completes wrongly.
-- **New node-agent + old storage:** the annotation is ignored. Heartbeat chunks are merged as
+  report to the last. Every container start then leaves a gap of up to `initialDelay` (2 minutes
+  by default) that is never learned, and workloads that start at the same time every day won't
+  complete through coverage. They complete as today. Nothing completes wrongly.
+- **New node-agent + old storage:** the annotations are ignored. Heartbeat chunks are merged as
   ordinary rows. Because they carry `SeccompProfile`, `ImageID` and `ImageTag`, they change
   nothing, and they cost one small write per idle container per interval. Otherwise as today.
 - **Downgrading storage:** profiles already completed stay completed (old storage honors
@@ -477,8 +477,8 @@ What it does **not** guarantee, same as today:
 ## Open questions
 
 1. **Pod informer cost.** A cluster-wide pod informer in storage (with a transform that keeps
-   only metadata, `spec.nodeName` and `status.containerStatuses`) adds memory and apiserver watch load. Could node-agent provide the
-   running intervals for the pods on its node instead? That would lose pods on nodes without a
+   only metadata, `spec.nodeName` and `status.containerStatuses`) adds memory and apiserver watch
+   load. Could node-agent provide the running intervals for the pods on its node instead? That would lose pods on nodes without a
    healthy node-agent, which the informer marks as running but unobserved.
 2. **Leader-elected jobs.** Should `Learned` require that *every* running replica was watched at a
    time of day? That's stricter, makes `Learned` depend on `R` (so on settled time only), and
@@ -513,10 +513,9 @@ What it does **not** guarantee, same as today:
     `completed`/`full` derivation, and rejection of later reports via `PreSave`;
   - chunks from old node-agents without `learning-start`.
 - **node-agent unit tests**: chunks carry `learning-start`, `container-id` and
-  `container-started-at`, and final reports after an exit carry `container-exited-at` (when the runtime provides it) and
-  `exit-observed-at`; an idle learning
-  container sends a linked heartbeat after `learningHeartbeatInterval`, in the stitch shape, and
-  stops sending them once learning stops.
+  `container-started-at`; final reports after an exit carry `container-exited-at` (when the runtime
+  provides it) and `exit-observed-at`; an idle learning container sends a linked heartbeat after
+  `learningHeartbeatInterval`, in the stitch shape, and stops sending them once learning stops.
 - **Component test**: a Deployment scaled 1→0→1 on a short schedule, with an artificially shortened
   day (day length configurable in tests). The profile must complete through coverage only after
   the zero-replica window has settled as vacant, must not complete if a replica ran unobserved
