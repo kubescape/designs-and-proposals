@@ -157,7 +157,9 @@ running evidence that arrives late can never invalidate it. Late evidence can on
 which can only shrink `Covered`, and the completion gate re-evaluates `Covered` when it runs.
 
 The gate evaluates coverage **as of the final report**, not as of the moment storage processes it.
-Its cutoff is the final report's `ReportTimestamp`. Evidence after the cutoff is ignored, and the
+Its cutoff is the final report's `ReportTimestamp`. Evidence about absolute time after the cutoff is
+ignored. This matters because the completing container keeps running after it stops learning, and
+that running must not count against it. The
 window `[cutoff - settle delay, cutoff]` is treated as occupied
 (`Occupied_gate = Occupied ∪ projection of that window`). So vacancy seen on an older day can't
 cover a time of day at which the workload may have just run, before its pod status reached storage,
@@ -216,8 +218,14 @@ and 00:30, say) extend one 30-minute segment instead of producing three disjoint
    to find the instance. This works the same way for ReplicaSets, StatefulSets, DaemonSets and
    Jobs, and includes terminating pods. Informer gaps (storage restart, watch expiry before resync)
    are recorded as unknown.
-3. **Time-of-day evaluation.** storage keeps `R`, `U` and `L` in absolute time for a bounded
-   look-back window (e.g. `2 × T`) in its own metadata table. When a segment is extended, it adds
+3. **Time-of-day evaluation.** storage keeps `R`, `U` and `L` **dated**, in absolute time, for a
+   bounded look-back window (e.g. `2 × T`) in its own metadata table. Evidence older than the
+   window is folded into an undated **baseline**: the projections of everything before the window
+   start, kept as the same three time-of-day sets. The gate's sets for a cutoff `c` are the
+   baseline plus the projections of dated evidence about times `≤ c`. This is exact as long as `c`
+   is inside the window. A cutoff older than the window start can't be reconstructed, so the gate
+   rejects it and the profile stays `learning`. That can't happen in practice: a final report is
+   processed within minutes, and the window is days. When a segment is extended, it adds
    its projection to `Learned` straight away. When running or unknown evidence arrives, it adds its
    projection to `Occupied` straight away. Once absolute time becomes settled, it adds the
    projection of its known not-running part to `Vacant`. Evidence that arrives late, for example the next
@@ -429,8 +437,10 @@ What it does **not** guarantee, same as today:
   - segment construction across consolidation passes, split rows and broken links;
   - time-of-day set evaluation (fragments inside a minute, transitions, terminating pods, informer
     gaps, the asymmetric settle delay, late `L` and late `R` evidence, the interval cap);
-  - the gate's cutoff at the final `ReportTimestamp` (processing delay must not matter) and its
-    treatment of the window before it as occupied;
+  - the gate's cutoff at the final `ReportTimestamp` (processing delay must not matter, running
+    after the cutoff must not count), its treatment of the window before it as occupied, and the
+    rejection of a cutoff older than the retained window;
+  - folding of expired dated evidence into the baseline;
   - the `Occupied` block on the vacancy path;
   - the completion gate for `coverage-completed`, other final statuses and legacy reports, and the
     aggregate `completed`/`full` derivation for a `partial` final series;
