@@ -241,8 +241,10 @@ completes the profile.
    - `PreSave` rejects new reports, and node-agent stops each container still learning on its next
      report (`ObjectCompletedError`), as it does today when another replica completes first;
    - consolidation treats the profile as frozen and reclaims leftover rows, as today.
-6. **Visibility** (annotations on the consolidated profile, informational):
-   - `kubescape.io/coverage-ratio`: share of the day covered, e.g. `0.93`;
+6. **Visibility** (annotations on the consolidated profile):
+   - `kubescape.io/coverage-ratio`: share of the day covered, e.g. `0.93`. This is the learning
+     **progress** consumers should show for a profile in `learning`. "Elapsed time / learning
+     period" is no longer meaningful once a profile can complete before `T` has elapsed;
    - `kubescape.io/completion-source: coverage` when this rule completed the profile.
 
 ### node-agent changes
@@ -255,8 +257,10 @@ completes the profile.
 2. **Heartbeat reports.** Today a chunk with nothing new is skipped. An idle container then extends
    its learning segment only when its next real report, or its final report, arrives, which can
    delay coverage by hours. node-agent sends a **heartbeat chunk** for a container that is still
-   learning when no report has been sent for it for `learningHeartbeatInterval` (default: equal to
-   `updateDataPeriod`, 10m; `0` disables it).
+   learning when no report has been sent for it for `learningHeartbeatInterval` (default
+   `3 × updateDataPeriod`, i.e. 30m; `0` disables it). A multiple of the report period keeps the
+   write cost low: at most 2 heartbeats per hour per idle learning container. Coverage then lags
+   real time by at most the interval, which can only delay completion, never falsify it.
    - It links into the chain like any report (`PreviousReportTimestamp` set to the last sent report,
      a new `ReportTimestamp`), and carries `kubescape.io/heartbeat: "true"`.
    - Its spec follows the existing `stitchChunk` shape (`queue/containerprofile_split.go`): it
@@ -332,6 +336,12 @@ What it does **not** guarantee, same as today:
 - **Downgrading storage:** profiles already completed stay completed (old storage honors
   `completed`/`full`). Coverage evidence is no longer collected, and the rest behaves as today.
   No new status or protocol exists that old storage could misread.
+- **Consumers that assume completion at start + `T`.** A profile can now complete before its
+  learning period has elapsed. UIs and backends that compute learning progress as elapsed time over
+  the learning period should switch to `kubescape.io/coverage-ratio`. Anything scheduled from an
+  expected completion time should key off the profile's actual `completed` status instead. The
+  learning period itself still matches the configured value exactly; a coverage completion is
+  simply an earlier completion.
 - No change to the `ContainerProfile` spec, and no new status value. Only new annotations.
 
 ## Alternatives considered
