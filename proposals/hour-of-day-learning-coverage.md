@@ -15,9 +15,9 @@ has already merged many hours of behavior from their containers into the profile
 This proposal lets **storage** complete such a profile once, for every moment of the UTC day, the
 workload has either been learned at that time of day or has never run at that time of day — no
 matter how many containers it took. Storage already holds the merged profile, the report chains of
-every container, and a Kubernetes client, so it has everything needed. node-agent adds one
-annotation (`kubescape.io/learning-start`) and a heartbeat report for idle containers; its learning
-timer is unchanged. When storage completes
+every container, and a Kubernetes client, so it has everything needed. node-agent adds a few
+chunk annotations (watch start, container ID and exact container lifetime) and a heartbeat report
+for idle containers; its learning timer is unchanged. When storage completes
 a profile, containers still learning are stopped through the existing "already completed" path.
 
 The rule keeps the guarantee that motivates the 24h default: **every time of day at which the
@@ -123,12 +123,26 @@ ReplicaSet, StatefulSet, DaemonSet or Job, plus container name), storage collect
 **absolute-time** evidence:
 
 - **Running intervals `R`**: when a container of that name, in any pod owned by the workload
-  instance, was running. They come from the pods' `containerStatuses` (`state.running.startedAt`,
-  `state.terminated.startedAt`/`finishedAt`, and `lastState` for restarts), so a container in a
-  terminating pod counts as running until it actually finishes. These timestamps have one-second
-  precision, so running intervals are rounded **outward** to whole seconds.
-- **Unknown periods `U`**: when storage's pod informer was not synced and watching. They are treated
-  as running.
+  instance, was running. Each run is one **container attempt**, identified by its runtime
+  container ID (`containerStatuses[].containerID`, which changes on every restart).
+  - For an attempt node-agent watched, the interval is exactly the lifetime node-agent reports
+    (see "node-agent changes"), matched by container ID: from `kubescape.io/container-started-at`
+    to `kubescape.io/container-ended-at`, or still open.
+  - For any other attempt, it comes from `containerStatuses` (`state.running.startedAt`,
+    `state.terminated.startedAt`/`finishedAt`, `lastState`). Those timestamps have one-second
+    precision, so these intervals are rounded **outward** to whole seconds.
+
+  A container in a terminating pod counts as running until it actually finishes.
+- **Unknown periods `U`**, treated as running: any time for which a pod's container history can't
+  be fully reconstructed:
+  - storage's pod informer was not synced and watching;
+  - the pod's node was not `Ready` (its kubelet may be disconnected, so the pod status is stale and
+    can hide runs), from the moment the node stopped being `Ready` until it is `Ready` again and the
+    pod status has been refreshed;
+  - a container's `restartCount` grew by more than one between two observed statuses. The
+    intermediate attempts aren't in `containerStatuses` anymore, so the whole interval between the
+    two observations is unknown;
+  - an attempt whose container ID appears without a start time storage can establish.
 - **Learning segments `L`**: when node-agent was verifiably watching such a container, taken from
   the report chains (see "Learning segments" below).
 
@@ -144,7 +158,7 @@ disjoint intervals over `[00:00, 24:00)` with millisecond endpoints:
 
 | Set | Contains time of day `τ` when, on some day, … | Rounding |
 |---|---|---|
-| `Learned` | some container of the profile key was inside a learning segment at `τ` (projection of `L`). | inward |
+| `Learned` | some container of the profile key was inside a learning segment at `τ` (projection of `L`). | inward, never padded |
 | `Occupied` | the container was running, or its state unknown, at `τ` (projection of `R ∪ U`, used immediately). | outward |
 | `Vacant` | the state was settled and known, and the container was not running at `τ`. | inward |
 
@@ -172,19 +186,22 @@ intervals (they can only shrink). Either way the result is conservative.
 
 A **learning segment** is a maximal interval during which one series is verifiably watched:
 
-- If the series' first report links back to nothing, it starts at the series' **watch start**, the
-  new `kubescape.io/learning-start` annotation (see "node-agent change"). For a `full` series,
-  node-agent caught the container at creation, before its process ran, so the segment starts at the
-  container's start (`startedAt`, rounded down) when that is earlier. Without this, every container
-  start would leave a short unlearned gap. A workload that scales up at the same time every day
-  would leave that gap at the same time of day, and never complete.
+- If the series' first report links back to nothing, it starts at the series' **watch start**
+  (`kubescape.io/learning-start`, see "node-agent changes"). For a `full` series, node-agent caught
+  the container at creation, before its process ran, so its watch start is the container's start
+  (`kubescape.io/container-started-at`). The attempt's running interval starts at the very same
+  timestamp, so no unlearned gap is left at start-up. Without this, a workload that scales up at the
+  same time every day would leave the same gap every morning and never complete.
 - After a broken link, it starts at the `ReportTimestamp` of the first report after the gap: data
   between a missing report and its successor is lost, so that time isn't credited.
 - It is extended to the `ReportTimestamp` of every report that links to its predecessor.
-- When a series ends with its container's exit, node-agent watched the container until it
-  finished. So its last segment ends at the container's `finishedAt` (rounded up) when that is
-  later than the final `ReportTimestamp`. Like the start rule, this keeps a container watched for
-  its whole life from leaving sub-second unlearned slivers.
+- When a series ends with its container's exit, its final report carries
+  `kubescape.io/container-ended-at`: the time node-agent observed the exit, which is at or after the
+  actual exit. node-agent watched the container until then, so the last segment ends there. The
+  attempt's running interval ends at the same timestamp, so no unlearned sliver is left at exit.
+- Segment bounds are always node-agent's verified observation bounds. They are never rounded or
+  padded. If the lifetime annotations are missing (older node-agent), the segment starts at the
+  first report and ends at the last report, and the uncertain edges stay uncovered.
 - A broken link closes a segment.
 
 Because the collapsed row keeps only the chain's latest `ReportTimestamp`, storage persists, per
@@ -198,7 +215,10 @@ For a profile key in status `learning` whose effective learning period `T` (from
 learning-period label) is at least 24h, storage completes the profile when:
 
 1. `Covered` is the whole day `[00:00, 24:00)`, **and**
-2. at least one contributing series was a full observation (completion `full`), so start-up
+2. at least one contributing series is a **received full observation**: completion `full`, **and**
+   storage received and merged its initial report (the one whose `PreviousReportTimestamp` is
+   empty). A `full` series whose initial report was lost, so that it begins with a disconnected tail,
+   doesn't count, because its start-up data never reached the profile. This ensures start-up
    behavior is in the profile, **and**
 3. for `T > 24h`, the total learned wall-clock time (union of learning segments, not their sum) is
    at least `T`.
@@ -216,10 +236,15 @@ completes the profile.
    report. Its row is recorded with `hasData=false` and its payload is not stored or merged, since
    it carries no new behavior.
 2. **Running intervals.** A pod informer (one per cluster, metadata and `status.containerStatuses`
-   only) records `R` per workload instance and container name, using each pod's `ownerReferences`
-   to find the instance. This works the same way for ReplicaSets, StatefulSets, DaemonSets and
-   Jobs, and includes terminating pods. Informer gaps (storage restart, watch expiry before resync)
-   are recorded as `U`.
+   only) records container attempts per workload instance and container name. It uses each pod's
+   `ownerReferences` to find the instance, and works the same way for ReplicaSets, StatefulSets,
+   DaemonSets and Jobs, including terminating pods.
+   - Attempts with a matching series (by container ID) take node-agent's lifetime bounds; all others
+     take outward-rounded pod-status times.
+   - A node informer tracks the `Ready` condition. storage's ClusterRole already allows
+     `get`/`watch`/`list` on pods; it needs `watch` on nodes in addition to `list`.
+   - Informer gaps, not-`Ready` nodes, `restartCount` jumps greater than one, and attempts without
+     an establishable start are recorded as `U`.
 3. **Time-of-day sets.** storage keeps the three sets per profile key in its own metadata table:
    - when a segment is extended, its projection is added to `Learned`;
    - when running or unknown evidence arrives, its projection is added to `Occupied`;
@@ -249,11 +274,22 @@ completes the profile.
 
 ### node-agent changes
 
-1. **Watch start.** Add `kubescape.io/learning-start` (the time node-agent started watching the
-   container, RFC 3339 with sub-second precision) to every chunk.
+1. **Watch and lifetime bounds.** Add to every chunk, RFC 3339 with sub-second precision:
+   - `kubescape.io/learning-start`: when node-agent started watching the container;
+   - `kubescape.io/container-id`: the runtime container ID, the same value kubelet reports in
+     `containerStatuses[].containerID`;
+   - `kubescape.io/container-started-at`: the container's start as node-agent knows it
+     (`Runtime.ContainerStartedAt`, which node-agent already uses to tell pre-running containers
+     apart).
 
-   storage can't derive this on its own. A chunk identifies the workload instance and container
-   name, but not the pod, so storage can't match it to a pod's `startedAt`.
+   On the final report after an exit, also add `kubescape.io/container-ended-at`: when node-agent
+   observed the exit.
+
+   storage can't derive these on its own. A chunk identifies the workload instance and container
+   name, but not the pod or the attempt, and pod-status timestamps are only precise to the second.
+   With the container ID, storage maps each series to exactly one container attempt, even with
+   overlapping replicas and restarts. With the lifetime bounds, that attempt's running interval and
+   its learning segment share the same endpoints.
 2. **Heartbeat reports.** Today a chunk with nothing new is skipped. An idle container then extends
    its learning segment only when its next real report, or its final report, arrives, which can
    delay coverage by hours. node-agent sends a **heartbeat chunk** for a container that is still
@@ -303,9 +339,10 @@ What it does **not** guarantee, same as today:
 ### Worked examples
 
 - **Nightly scale-to-zero (06:00–20:00 UTC up), pod informer synced throughout.**
-  - Day 1: a container starts at 06:00:20, is watched for its whole life, and stops at 20:00:05.
-    `Learned` gets 06:00:20–20:00:06 (start and end rounded outward, like `Occupied`). Nothing runs
-    overnight, so as the night settles, 20:00:06 onwards goes into `Vacant` and never into
+  - Day 1: a container starts at 06:00:20.412, is watched for its whole life, and node-agent
+    observes its exit at 20:00:05.630. Its running interval and its learning segment are both
+    06:00:20.412–20:00:05.630, so `Learned` and `Occupied` get exactly that. Nothing runs
+    overnight, so as the night settles, 20:00:05.630 onwards goes into `Vacant` and never into
     `Occupied`.
   - Day 2: a new container starts at 06:00:15 and is learned from there. By ~06:10:15 the night up
     to 06:00:15 has settled as vacant, so the whole day is covered. The next consolidation pass
@@ -324,10 +361,11 @@ What it does **not** guarantee, same as today:
 ## Compatibility and rollout
 
 - **Feature flags**, default off at first: storage `containerProfileCoverage.enabled`, and node-agent
-  `learningHeartbeatInterval` (0 = off). The `learning-start` annotation is always sent; it is
-  harmless on its own.
-- **Old node-agent + new storage:** chunks have no `learning-start`, so segments start at the first
-  report. Every container start then leaves a gap of up to `initialDelay` (2 minutes by default)
+  `learningHeartbeatInterval` (0 = off). The new chunk annotations are always sent; they are
+  harmless on their own.
+- **Old node-agent + new storage:** chunks have no lifetime annotations, so series can't be matched
+  to attempts. Every attempt takes outward-rounded pod-status times, and segments run from the first
+  report to the last. Every container start then leaves a gap of up to `initialDelay` (2 minutes by default)
   that is never learned, and workloads that start at the same time every day won't complete through
   coverage. They complete as today. Nothing completes wrongly.
 - **New node-agent + old storage:** the annotation is ignored. Heartbeat chunks are merged as
@@ -395,7 +433,10 @@ What it does **not** guarantee, same as today:
 
 - **storage unit tests**:
   - segment construction across consolidation passes, split rows, broken links, and the
-    start and end rules for full series;
+    start and end rules for full series, with no rounding of `Learned`;
+  - attempt matching by container ID with overlapping replicas and restarts;
+  - unknown periods from not-`Ready` nodes and `restartCount` jumps;
+  - the received-full-observation condition, with a `full` series whose initial report is lost;
   - time-of-day set evaluation: fragments inside a minute, transitions, terminating pods, informer
     gaps, the asymmetric settle delay and the unsettled window, late `L` and late `R` evidence, the
     interval cap;
@@ -404,7 +445,8 @@ What it does **not** guarantee, same as today:
   - completion: the three conditions, `T < 24h` and non-`learning` profiles left alone,
     `completed`/`full` derivation, and rejection of later reports via `PreSave`;
   - chunks from old node-agents without `learning-start`.
-- **node-agent unit tests**: chunks carry `kubescape.io/learning-start`; an idle learning
+- **node-agent unit tests**: chunks carry `learning-start`, `container-id` and
+  `container-started-at`, and final reports after an exit carry `container-ended-at`; an idle learning
   container sends a linked heartbeat after `learningHeartbeatInterval`, in the stitch shape, and
   stops sending them once learning stops.
 - **Component test**: a Deployment scaled 1→0→1 on a short schedule, with an artificially shortened
