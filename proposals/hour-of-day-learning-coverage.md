@@ -15,7 +15,8 @@ taken together, have been watched around the clock.
 This proposal lets **storage** complete such a profile once **every time of day has been watched**
 by some container of the workload, on some day. Storage already holds the merged profile and the
 report chains of every container, so it can tell exactly when each container was watched. node-agent
-adds two annotations and a heartbeat report; its learning timer is unchanged. When storage completes
+adds a few report annotations (verified watch, alive and exit times, lost-event flags) and a
+heartbeat report; its learning timer is unchanged. When storage completes
 a profile, containers still learning are stopped through the existing "already completed" path.
 
 The guarantee is the one the 24h default exists for: **every time of day has been observed**, so
@@ -147,16 +148,24 @@ intervals) its shortest intervals are dropped, which can only shrink it, so it s
   **watch start** (`kubescape.io/learning-start`, see "node-agent changes"). After a broken link,
   it starts at the `ReportTimestamp` of the first report after the gap: data between a missing
   report and its successor is lost, so that time isn't credited.
-- **Extension.** It is extended to the `ReportTimestamp` of every report that links to its
-  predecessor. Heartbeat reports count (see "node-agent changes").
+- **Extension.** It is extended by every report that links to its predecessor, **up to the
+  report's verified alive time** (`kubescape.io/observed-alive-at`): the last moment node-agent
+  confirmed the container was still running, not merely when the report was sent. A report or
+  heartbeat sent after the container exited, but before node-agent handled the exit notification,
+  therefore can't credit time in which nothing ran. Heartbeat reports count (see "node-agent
+  changes").
+- **Lossy periods.** A report flagged `kubescape.io/events-dropped: "true"` lost events during its
+  period (since the previous report). Its period is **not** credited: the segment closes at the
+  previous report and a new one starts at this report's alive time. Linkage alone doesn't prove the
+  period was observed without loss.
 - **End.** A broken link closes it. When the series ends with the container's exit, it ends at the
   **verified runtime exit time** (`kubescape.io/container-exited-at`), not when node-agent handled
   the exit notification: after the exit nothing was running in that container, so that time must
   not count as watched. If no verified exit time is available, it ends at the last report sent
   before the exit.
-- **No rounding.** Segment bounds are always node-agent's verified observation bounds. If the
-  annotations are missing (older node-agent), the segment starts at the first report, and the
-  uncertain start stays unlearned.
+- **No rounding.** Segment bounds are always node-agent's verified observation bounds. Reports
+  without `observed-alive-at` (older node-agent) credit nothing, so they never contribute to
+  `Learned`.
 
 Because the collapsed row keeps only the chain's latest `ReportTimestamp`, storage persists, per
 active series, the current segment's `[start, end]` and the last linked `ReportTimestamp` across
@@ -173,14 +182,18 @@ cluster-wide while a profile is learning. storage then keeps the **largest** val
 evidence required, never less) and doesn't lower it. If no chunk of the profile key carries the
 label, `T` is unknown and coverage completion doesn't apply to that profile.
 
-For a profile key in status `learning` whose frozen effective `T` is at least 24h, storage
-completes the profile when:
+For a profile key in status `learning` whose frozen effective `T` is at least 24h, and whose pod
+template doesn't carry `kubescape.io/learning-coverage: "disabled"` (reported on chunks as a
+label, like the learning period), storage completes the profile when:
 
 1. `Learned` is the whole day `[00:00, 24:00)`, **and**
-2. at least one contributing series is a **received full observation**: completion `full`, **and**
-   storage received and merged its initial report (the one whose `PreviousReportTimestamp` is
-   empty). A `full` series whose initial report was lost doesn't count, because its start-up data
-   never reached the profile. This ensures start-up behavior is in the profile, **and**
+2. at least one contributing series is a **received full start-up observation**: it carries
+   `kubescape.io/watched-from-start: "true"` (node-agent caught the container at creation), storage
+   received and merged its initial report (the one whose `PreviousReportTimestamp` is empty), and
+   that initial report is not flagged `events-dropped`. The existing `full`/`partial` completion
+   annotation can't be used for this: node-agent sets `partial` both for a late watch start and,
+   permanently, after any dropped event, so it conflates the two. This ensures start-up behavior is
+   in the profile, **and**
 3. for `T > 24h`, the total learned wall-clock time (union of learning segments, not their sum) is
    at least `T`.
 
@@ -197,8 +210,10 @@ Whichever path comes first completes the profile. Coverage only applies while th
 
 ### Storage changes
 
-1. **Learning segments.** Read `kubescape.io/learning-start`, `kubescape.io/container-exited-at`
-   and the completion annotation from chunks, and build and persist segments as described above.
+1. **Learning segments.** Read `kubescape.io/learning-start`, `kubescape.io/observed-alive-at`,
+   `kubescape.io/events-dropped`, `kubescape.io/watched-from-start` and
+   `kubescape.io/container-exited-at` from chunks, and build and persist segments as described
+   above.
    A heartbeat chunk (`kubescape.io/heartbeat: "true"`) extends the segment like any linked
    report. Its row is recorded with `hasData=false` and its payload is not stored or merged, since
    it carries no new behavior.
@@ -218,9 +233,16 @@ Whichever path comes first completes the profile. Coverage only applies while th
      report (`ObjectCompletedError`), as it does today when another replica completes first;
    - consolidation treats the profile as frozen and reclaims leftover rows, as today.
 5. **Visibility** (annotations on the consolidated profile):
-   - `kubescape.io/coverage-ratio`: the share of the day in `Learned`, e.g. `0.93`. This is the
-     learning **progress** consumers should show for a profile in `learning`. "Elapsed time /
-     learning period" is no longer meaningful once a profile can complete before `T` has elapsed;
+   - `kubescape.io/coverage-ratio`: the share of the day in `Learned`, e.g. `0.93`. It reports
+     daily coverage only;
+   - `kubescape.io/learning-progress`: the progress consumers should show for a profile in
+     `learning`, defined so that it reaches `1.0` only when the coverage rule is met:
+     - `T = 24h`: `coverage-ratio`;
+     - `T > 24h`: `min(coverage-ratio, learnedSeconds / T)`, because condition 3 still needs the
+       learned-time union to reach `T` after the day is covered (with `T = 48h`, coverage can be
+       full after one day while progress is `0.5`);
+     - `T < 24h`, unknown `T`, or coverage opted out: not set. Those profiles complete only through
+       the timer, so consumers keep today's elapsed-time computation for them;
    - `kubescape.io/completion-source: coverage` when this rule completed the profile.
 
 No informers and no new RBAC are needed: everything comes from the report chains storage already
@@ -231,12 +253,21 @@ receives.
 1. **Watch and exit bounds.**
    - Add `kubescape.io/learning-start` to every chunk: when node-agent started watching the
      container, RFC 3339 with sub-second precision.
+   - Add `kubescape.io/watched-from-start: "true"` when node-agent caught the container at
+     creation. This is the existing pre-running-container decision (`ContainerStartedAt` compared
+     with the agent's start), reported on its own, independent of dropped events.
+   - Add `kubescape.io/observed-alive-at` to every chunk, heartbeats included: the time of the
+     latest check, made while preparing the report, that the container's process was still alive.
+   - Add `kubescape.io/events-dropped: "true"` to a chunk whose period (since the previous report)
+     lost events. Unlike today's sticky `droppedEvents` flag, which turns the whole container
+     `partial` for the rest of its life, this flag is reset after every report.
    - On the final report after an exit, add `kubescape.io/container-exited-at`: the **verified**
      exit time from the container runtime (the CRI `ContainerStatus.finished_at`, nanosecond
      precision), when node-agent can obtain it.
 
    storage can't derive these: the first report arrives `initialDelay` (2 minutes by default) after
-   the watch starts, and the final report arrives after the exit was handled, not at the exit.
+   the watch starts, a report's timestamp says when it was sent, not that the container was still
+   running, and the final report arrives after the exit was handled, not at the exit.
 2. **Heartbeat reports.** Today a chunk with nothing new is skipped. An idle container then extends
    its learning segment only when its next real report, or its final report, arrives, which can
    delay coverage by hours. node-agent sends a **heartbeat chunk** for a container that is still
@@ -246,6 +277,8 @@ receives.
    real time by at most the interval, which can only delay completion, never falsify it.
    - It links into the chain like any report (`PreviousReportTimestamp` set to the last sent report,
      a new `ReportTimestamp`), and carries `kubescape.io/heartbeat: "true"`.
+   - Like every report, it carries `observed-alive-at`. A heartbeat prepared after the container
+     exited carries the earlier alive time, so it can't extend the segment past the exit.
    - Its spec follows the existing `stitchChunk` shape (`queue/containerprofile_split.go`): it
      carries only `SeccompProfile`, `ImageID` and `ImageTag`. Storage merges those three by
      assignment, so an empty spec would zero them on the merged profile in storage that doesn't
@@ -263,14 +296,24 @@ watched without a gap **at that exact time of day**. If the job ran then, its ex
 syscalls and network peers were recorded. Watching a neighboring moment is not enough: observing
 02:00:00–02:00:10 says nothing about 02:00:45.
 
-This is the same guarantee today's rule gives. A single container learning 24h watches each time
-of day exactly once, on one day, and says nothing about runs on other days. The new rule relaxes
-only one requirement: that the whole day be watched by the *same* container on *consecutive*
-hours.
+For **time-of-day** behavior, this is the same guarantee today's rule gives. A single container
+learning 24h watches each UTC time of day exactly once, on one day, and says nothing about runs on
+other days. The new rule relaxes only one requirement: that the whole day be watched by the *same*
+container on *consecutive* hours.
+
+It is **not** equivalent for **uptime-dependent** behavior. Today's rule watches one container
+through its first 24h of uptime, so behavior that first happens after, say, 18h of uptime (a cache
+rotation, a token refresh, a scheduled compaction counted from process start) is observed. A union
+of 6h runs covers every time of day but never reaches 18h of uptime, so that behavior would happen
+for the first time after the profile is frozen. Workloads that have such behavior, and whose
+containers do live long enough to reach it, can opt out per workload with the pod-template label
+`kubescape.io/learning-coverage: "disabled"`, which keeps today's single-container rule for them.
 
 What it does **not** guarantee, same as today:
 
 - behavior that does not recur daily;
+- uptime-dependent behavior beyond what the watched containers reached (see above; today's rule
+  has the same limit at `T` of uptime);
 - a job that runs only on one replica that wasn't being watched while another replica was.
   `Learned` asks that at every time of day *some* replica was watched, not every replica.
   Replicas of one pod template run the same code, but in-process leader election can confine a
@@ -305,17 +348,16 @@ Documentation should state plainly:
   one rollout and learning starts once more from there.
 - `kubescape.io/coverage-ratio` shows how much of the day has been watched, which makes it easy to
   spot workloads stuck below `1.0` because they don't run around the clock.
+- Workloads whose behavior depends on container uptime rather than time of day can keep today's
+  rule with `kubescape.io/learning-coverage: "disabled"`.
 
 ## Compatibility and rollout
 
 - **Feature flags**, default off at first: storage `containerProfileCoverage.enabled`, and node-agent
   `learningHeartbeatInterval` (0 = off). The new chunk annotations are always sent; they are
   harmless on their own.
-- **Old node-agent + new storage:** no `learning-start` or `container-exited-at`. Segments start at
-  the first report and end at the last report before an exit, so a few minutes around each
-  container start stay unlearned. For always-on workloads with churn, other replicas usually cover
-  those times on other days, so coverage still works; otherwise the profile completes as today.
-  Nothing completes wrongly.
+- **Old node-agent + new storage:** reports carry no `observed-alive-at`, so they credit nothing
+  and coverage never completes a profile. Everything behaves as today.
 - **New node-agent + old storage:** the annotations are ignored. Heartbeat chunks are merged as
   ordinary rows. Because they carry `SeccompProfile`, `ImageID` and `ImageTag`, they change
   nothing, and they cost one small write per idle container per interval. Otherwise as today.
@@ -324,8 +366,10 @@ Documentation should state plainly:
   status or protocol exists that old storage could misread.
 - **Consumers that assume completion at start + `T`.** A profile can now complete before its
   learning period has elapsed. UIs and backends that compute learning progress as elapsed time over
-  the learning period should switch to `kubescape.io/coverage-ratio`. Anything scheduled from an
-  expected completion time should key off the profile's actual `completed` status instead.
+  the learning period should use `kubescape.io/learning-progress` when it is set, and keep the
+  elapsed-time computation when it isn't (`T < 24h`, unknown `T`, or opted out). Anything
+  scheduled from an expected completion time should key off the profile's actual `completed`
+  status instead.
 - No change to the `ContainerProfile` spec, and no new status value. Only new annotations.
 
 ## Alternatives considered
@@ -377,6 +421,12 @@ Documentation should state plainly:
   - segment construction across consolidation passes, split rows and broken links, heartbeat chunks
     (extending without merging), start at `learning-start`, end at `container-exited-at` or at the
     last report before the exit;
+  - extension only up to `observed-alive-at`, including a delayed exit notification with an
+    intervening report and heartbeat sent after the exit;
+  - lossy periods (`events-dropped`) excluded from `Learned`, and a lossy initial report failing
+    condition 2;
+  - `learning-progress` for `T = 24h`, `T = 48h` (full coverage, half progress) and `T < 24h`
+    (not set), and the `learning-coverage: disabled` opt-out;
   - the `Learned` set: projection across midnight, exact millisecond bounds with no padding, the
     interval cap;
   - effective `T`: frozen on first sight, raised on conflicting labels, unknown without the label;
@@ -385,10 +435,11 @@ Documentation should state plainly:
     `completed`/`full` derivation, rejection of later reports via `PreSave`, and the existing
     paths winning when they come first;
   - chunks from old node-agents without the new annotations.
-- **node-agent unit tests**: chunks carry `learning-start`; final reports after an exit carry
-  `container-exited-at` when the runtime provides it; an idle learning container sends a linked
-  heartbeat after `learningHeartbeatInterval`, in the stitch shape, and stops sending them once
-  learning stops.
+- **node-agent unit tests**: chunks carry `learning-start`, `watched-from-start` and
+  `observed-alive-at`; `events-dropped` is set only on the report whose period lost events and is
+  reset afterwards; final reports after an exit carry `container-exited-at` when the runtime
+  provides it; an idle learning container sends a linked heartbeat after
+  `learningHeartbeatInterval`, in the stitch shape, and stops sending them once learning stops.
 - **Component test**: a Deployment with replicas restarted on a short schedule so that no single
   container lives a full (shortened) day, while together they cover it. The profile must complete
   through coverage, and the running containers must stop learning afterwards. A second Deployment
