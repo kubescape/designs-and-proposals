@@ -15,8 +15,9 @@ has already merged many hours of behavior from their containers into the profile
 This proposal lets **storage** complete such a profile once, for every moment of the UTC day, the
 workload has either been learned at that time of day or has never run at that time of day — no
 matter how many containers it took. Storage already holds the merged profile, the report chains of
-every container, and a Kubernetes client, so it has everything needed. node-agent only adds one
-annotation (`kubescape.io/learning-start`); its learning timer is unchanged. When storage completes
+every container, and a Kubernetes client, so it has everything needed. node-agent adds one
+annotation (`kubescape.io/learning-start`) and a heartbeat report for idle containers; its learning
+timer is unchanged. When storage completes
 a profile, containers still learning are stopped through the existing "already completed" path.
 
 The rule keeps the guarantee that motivates the 24h default: **every time of day at which the
@@ -56,7 +57,7 @@ learning reached 24h, all 31 stage ReplicaSets had never been observed between 2
 
 - Complete a profile once every time of day at which the workload ran has been observed, whether
   by one container or several.
-- Keep the change in storage, with node-agent's learning logic untouched.
+- Keep the decision in storage, with node-agent's learning timer and completion paths untouched.
 - Be conservative under missing information: when in doubt, keep learning.
 - Be backward compatible in both directions of version skew, with no new completion protocol.
 
@@ -210,7 +211,10 @@ completes the profile.
 ### Storage changes
 
 1. **Learning segments.** Read `kubescape.io/learning-start` and the completion annotation from
-   chunks, and build and persist segments as described above.
+   chunks, and build and persist segments as described above. A heartbeat chunk
+   (`kubescape.io/heartbeat: "true"`, see "node-agent changes") extends the segment like any linked
+   report. Its row is recorded with `hasData=false` and its payload is not stored or merged, since
+   it carries no new behavior.
 2. **Running intervals.** A pod informer (one per cluster, metadata and `status.containerStatuses`
    only) records `R` per workload instance and container name, using each pod's `ownerReferences`
    to find the instance. This works the same way for ReplicaSets, StatefulSets, DaemonSets and
@@ -230,8 +234,9 @@ completes the profile.
    **same transaction** that deletes the consolidated time-series rows, so a crash can neither drop
    nor double-count an interval. Past a cap (e.g. 256 ranges) the shortest ranges are dropped, which
    can only under-count.
-5. **Evaluation and completion.** During each consolidation pass, for every profile key in
-   `learning` with `T ≥ 24h`, storage evaluates the completion rule. When it holds, storage sets the
+5. **Evaluation and completion.** Storage evaluates the completion rule on **every consolidation
+   pass**, for every profile key in `learning` with `T ≥ 24h`. That is where segments are extended
+   and rows are deleted anyway, so the evidence is current and no extra trigger is needed. When it holds, storage sets the
    consolidated profile to `completed`/`full`. From then on:
    - `PreSave` rejects new reports, and node-agent stops each container still learning on its next
      report (`ObjectCompletedError`), as it does today when another replica completes first;
@@ -240,15 +245,29 @@ completes the profile.
    - `kubescape.io/coverage-ratio`: share of the day covered, e.g. `0.93`;
    - `kubescape.io/completion-source: coverage` when this rule completed the profile.
 
-### node-agent change
+### node-agent changes
 
-Add `kubescape.io/learning-start` (the time node-agent started watching the container, RFC 3339
-with sub-second precision) to every chunk. That is the only change: the learning timer, the final
-reports and the handling of `ObjectCompletedError` stay as they are.
+1. **Watch start.** Add `kubescape.io/learning-start` (the time node-agent started watching the
+   container, RFC 3339 with sub-second precision) to every chunk.
 
-The annotation is needed because storage can't derive the watch start on its own. A chunk
-identifies the workload instance and container name, but not the pod, so storage can't match it to
-a pod's `startedAt`.
+   storage can't derive this on its own. A chunk identifies the workload instance and container
+   name, but not the pod, so storage can't match it to a pod's `startedAt`.
+2. **Heartbeat reports.** Today a chunk with nothing new is skipped. An idle container then extends
+   its learning segment only when its next real report, or its final report, arrives, which can
+   delay coverage by hours. node-agent sends a **heartbeat chunk** for a container that is still
+   learning when no report has been sent for it for `learningHeartbeatInterval` (default: equal to
+   `updateDataPeriod`, 10m; `0` disables it).
+   - It links into the chain like any report (`PreviousReportTimestamp` set to the last sent report,
+     a new `ReportTimestamp`), and carries `kubescape.io/heartbeat: "true"`.
+   - Its spec follows the existing `stitchChunk` shape (`queue/containerprofile_split.go`): it
+     carries only `SeccompProfile`, `ImageID` and `ImageTag`. Storage merges those three by
+     assignment, so an empty spec would zero them on the merged profile in storage that doesn't
+     know about heartbeats.
+
+   Cost: one small write per idle learning container per interval. It stops when learning stops
+   (timer, exit, or `ObjectCompletedError`).
+
+The learning timer, the final reports and the handling of `ObjectCompletedError` stay as they are.
 
 ### Why this guarantees the daily cycle
 
@@ -300,12 +319,16 @@ What it does **not** guarantee, same as today:
 
 ## Compatibility and rollout
 
-- **Feature flag in storage only**, default off at first: `containerProfileCoverage.enabled`.
+- **Feature flags**, default off at first: storage `containerProfileCoverage.enabled`, and node-agent
+  `learningHeartbeatInterval` (0 = off). The `learning-start` annotation is always sent; it is
+  harmless on its own.
 - **Old node-agent + new storage:** chunks have no `learning-start`, so segments start at the first
   report. Every container start then leaves a gap of up to `initialDelay` (2 minutes by default)
   that is never learned, and workloads that start at the same time every day won't complete through
   coverage. They complete as today. Nothing completes wrongly.
-- **New node-agent + old storage:** the annotation is ignored. As today.
+- **New node-agent + old storage:** the annotation is ignored. Heartbeat chunks are merged as
+  ordinary rows. Because they carry `SeccompProfile`, `ImageID` and `ImageTag`, they change
+  nothing, and they cost one small write per idle container per interval. Otherwise as today.
 - **Downgrading storage:** profiles already completed stay completed (old storage honors
   `completed`/`full`). Coverage evidence is no longer collected, and the rest behaves as today.
   No new status or protocol exists that old storage could misread.
@@ -357,12 +380,6 @@ What it does **not** guarantee, same as today:
 4. **Evidence aging.** `Occupied` is permanent, so one unobserved night can delay coverage
    completion until today's rule kicks in. Should `Occupied` and `Vacant` evidence older than some
    window (e.g. 7 days) be dropped?
-5. **Idle-heartbeat reports.** An idle container extends its segment only when its next report or
-   its final report arrives, which delays (never falsifies) coverage. Should node-agent send an
-   empty linked report at least every few minutes? That would be a second, optional node-agent
-   change.
-6. **Evaluation cadence.** Is the consolidation pass the right place to evaluate, or should
-   evaluation be triggered when a profile's evidence changes?
 
 ## Testing
 
@@ -373,10 +390,13 @@ What it does **not** guarantee, same as today:
     gaps, the asymmetric settle delay and the unsettled window, late `L` and late `R` evidence, the
     interval cap;
   - the `Occupied` block on the vacancy path;
+  - heartbeat chunks extend segments without being merged;
   - completion: the three conditions, `T < 24h` and non-`learning` profiles left alone,
     `completed`/`full` derivation, and rejection of later reports via `PreSave`;
   - chunks from old node-agents without `learning-start`.
-- **node-agent unit test**: chunks carry `kubescape.io/learning-start`.
+- **node-agent unit tests**: chunks carry `kubescape.io/learning-start`; an idle learning
+  container sends a linked heartbeat after `learningHeartbeatInterval`, in the stitch shape, and
+  stops sending them once learning stops.
 - **Component test**: a Deployment scaled 1→0→1 on a short schedule, with an artificially shortened
   day (day length configurable in tests). The profile must complete through coverage only after
   the zero-replica window has settled as vacant, must not complete if a replica ran unobserved
