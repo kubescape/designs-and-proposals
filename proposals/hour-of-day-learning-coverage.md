@@ -156,12 +156,15 @@ Every set is a union over days, so it only grows. `Learned` does not depend on `
 running evidence that arrives late can never invalidate it. Late evidence can only grow `Occupied`,
 which can only shrink `Covered`, and the completion gate re-evaluates `Covered` when it runs.
 
-When the gate runs, the not-yet-settled window `[now - settle delay, now]` is also treated as
-occupied (`Occupied_gate = Occupied ∪ projection of the unsettled window`). So vacancy seen on an
-older day can't cover a time of day at which the workload may have just run, before its pod status
-reached storage. Recent times of day are covered only through `Learned`. The container whose final
-report triggers the gate was being watched up to that moment, so in the normal case those times
-are in `Learned`. The
+The gate evaluates coverage **as of the final report**, not as of the moment storage processes it.
+Its cutoff is the final report's `ReportTimestamp`. Evidence after the cutoff is ignored, and the
+window `[cutoff - settle delay, cutoff]` is treated as occupied
+(`Occupied_gate = Occupied ∪ projection of that window`). So vacancy seen on an older day can't
+cover a time of day at which the workload may have just run, before its pod status reached storage,
+and processing delay in storage changes nothing. Times of day in that window are covered only
+through `Learned`. node-agent guarantees they are: every shortened timer lasts at least the settle
+delay (see "node-agent changes"), so the completing container was watched throughout
+`[cutoff - settle delay, cutoff]`. The
 sets are bounded: past a cap (e.g. 512 intervals), `Occupied` merges its closest neighbors (it can
 only grow), and `Learned` and `Vacant` drop their shortest intervals (they can only shrink). Either
 way the result is conservative.
@@ -191,6 +194,11 @@ A **learning segment** is a maximal interval during which one series is verifiab
   at every start.
 - After a broken link, it starts at the `ReportTimestamp` of the first report after the gap: data
   between a missing report and its successor is lost, so that time isn't credited.
+- When a series ends with its container's exit, node-agent watched the container until it
+  finished. So its last segment ends at the container's `finishedAt` (rounded up) when that is
+  later than the final `ReportTimestamp`. This mirrors the start rule: running intervals are rounded
+  outward, and a container watched for its whole life must not leave sub-second unlearned slivers
+  at its start or end.
 - It is extended to the `ReportTimestamp` of every report that links to its predecessor.
 - A broken link closes it.
 
@@ -272,8 +280,12 @@ and 00:30, say) extend one 30-minute segment instead of producing three disjoint
                    started before watchStart can't be fully watched today, so it maps to its
                    next-day occurrence (12:34 with watchStart 12:34:30 counts as tomorrow's
                    12:34; one that starts exactly at watchStart counts today)
-       if uncovered is empty: deadline = now + floor   # floor: e.g. 2 × updateDataPeriod, to
-                                                       # send at least one linked report
+       if uncovered is empty: deadline = now
+       deadline = max(deadline, now + floor)   # floor = settle delay + updateDataPeriod, for EVERY
+                                               # shortened timer: the gate treats the last settle
+                                               # delay before the final report as occupied, so this
+                                               # container must have been watched through all of
+                                               # it, with at least one linked report
        if T > 24h: deadline = max(deadline, now + (T - learnedSeconds))
        timer = min(deadline - now, T)              # never longer than today; when the cap
                                                    # applies the container ends with
@@ -325,15 +337,13 @@ What it does **not** guarantee, same as today:
 ### Worked examples
 
 - **Nightly scale-to-zero (06:00–20:00 UTC up), pod informer synced throughout.**
-  - Day 1: a container starts at 06:00:20 and is watched from its start until it stops at 20:00:05.
-    `Learned` gets 06:00:20–20:00:05. Nothing runs overnight, so 20:00:06–06:00:19 goes into
-    `Vacant` (inward rounding loses at most a second at each end) and never into `Occupied`.
-    `Occupied` gets 06:00:20–20:00:05 (rounded outward), which is all learned.
-  - Day 2: the new container starts at 06:00:15, a few seconds earlier, and is learned from there.
-    The few seconds between 06:00:15 and 06:00:20 were vacant on day 1 and are learned on day 2,
-    so the whole day is covered. After the settle delay, a full `covered-minutes` is published, the
-    next timer is the floor, and the profile completes around 06:30 with `coverage-completed`.
-    Today it never completes.
+  - Day 1: a container starts at 06:00:20, is watched for its whole life, and stops at 20:00:05.
+    `Learned` gets 06:00:20–20:00:06 (start and end rounded outward, like `Occupied`). Nothing runs
+    overnight, so once settled, 20:00:06–06:00:20 goes into `Vacant` and never into `Occupied`. By
+    the next morning the whole day is covered.
+  - Day 2: the new container starts at ~06:00, reads a full `covered-minutes`, arms the floor timer
+    (settle delay + one report period, ~20 minutes), and completes the profile around 06:20 with
+    `coverage-completed`. Today it never completes.
 - **Spot churn, replicas overlapping around the clock.** Time of day goes into `Learned` as soon
   as some replica is watched at that time on some day. Typically the whole day is learned within
   ~24h of wall-clock time, instead of needing one container to survive 24h.
@@ -419,7 +429,8 @@ What it does **not** guarantee, same as today:
   - segment construction across consolidation passes, split rows and broken links;
   - time-of-day set evaluation (fragments inside a minute, transitions, terminating pods, informer
     gaps, the asymmetric settle delay, late `L` and late `R` evidence, the interval cap);
-  - the gate treating the unsettled window as occupied;
+  - the gate's cutoff at the final `ReportTimestamp` (processing delay must not matter) and its
+    treatment of the window before it as occupied;
   - the `Occupied` block on the vacancy path;
   - the completion gate for `coverage-completed`, other final statuses and legacy reports, and the
     aggregate `completed`/`full` derivation for a `partial` final series;
@@ -427,8 +438,9 @@ What it does **not** guarantee, same as today:
 - **Downgrade test**: a `coverage-completed` report sent to storage without this proposal leaves
   the profile `learning`.
 - **node-agent unit tests**: timer computation, table-driven over `covered-minutes`, current time, `T`
-  and full/partial cases, including an uncovered minute already in progress at watch start, plus
-  the old-storage fallback.
+  and full/partial cases, including an uncovered minute already in progress at watch start, the
+  floor on every shortened timer (including a single uncovered minute next to vacancy-only
+  coverage), plus the old-storage fallback.
 - **Component test**: a Deployment scaled 1→0→1 on a short schedule, with an artificially shortened
   day (minute length and day length configurable in tests). The profile must complete only after
   the zero-replica window has been recorded as vacant, and must not complete if a replica ran
