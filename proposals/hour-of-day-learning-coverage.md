@@ -76,8 +76,8 @@ learning reached 24h, all 31 stage ReplicaSets had never been observed between 2
 - **node-agent** (`pkg/containerprofilemanager/v1`):
   - When it starts watching a container, `addContainer` arms
     `time.AfterFunc(calculateSniffingTime(container), handleContainerMaxTime)`.
-    `calculateSniffingTime` returns `maxSniffingTimePerContainer` plus jitter, or the value of the
-    `kubescape.io/max-sniffing-time` pod label.
+    `calculateSniffingTime` returns exactly `maxSniffingTimePerContainer` (never jittered,
+    see kubescape/node-agent#1060), or the value of the `kubescape.io/max-sniffing-time` pod label.
   - Every `updateDataPeriod` (default 10m) it sends a time-series `ContainerProfile` chunk. Each
     chunk carries a series ID (one per watched container), `ReportTimestamp` and
     `PreviousReportTimestamp`.
@@ -165,7 +165,7 @@ Completion still happens through node-agent's final report. The rule only change
    if uncovered is empty: deadline = now + floor   (floor: e.g. 2 × updateDataPeriod, to send at
                                                     least one linked report)
    if T > 24h: deadline = max(deadline, now + (T - learnedSeconds))
-   timer = deadline - now   (never more than T + jitter, i.e. never longer than today)
+   timer = deadline - now   (never more than T, i.e. never longer than today)
    ```
 
    If the profile does not exist, can't be read, or has no masks (old storage), use `T` (today's
