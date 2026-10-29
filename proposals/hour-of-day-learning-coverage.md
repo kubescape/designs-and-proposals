@@ -160,16 +160,14 @@ disjoint intervals over `[00:00, 24:00)` with millisecond endpoints:
 | Set | Contains time of day `τ` when, on some day, … | Rounding |
 |---|---|---|
 | `Learned` | some container of the profile key was inside a learning segment at `τ` (projection of `L`). | inward, never padded |
-| `Occupied` | the container was running, or its state unknown, at `τ` (projection of final attempts and `U`; provisional attempts count immediately through `Occupied_eval`). | outward |
+| `Occupied` | the container was running, or its state unknown, at `τ`. Derived at every evaluation from the retained per-attempt records (each with its current best bounds) plus `U`, on top of a frozen baseline for evidence older than the reconciliation horizon. | outward |
 | `Vacant` | the state was settled and known, and the container was not running at `τ`. | inward |
 
 The time of day that is **covered** is
 
 ```
 Covered = Learned ∪ (Vacant \ Occupied_eval)
-Occupied_eval = Occupied
-              ∪ projection of provisional and still-running attempts
-              ∪ projection of [now - settle delay, now]
+Occupied_eval = Occupied ∪ projection of [now - settle delay, now]
 ```
 
 So a time of day is covered either because the workload was watched at that exact time on some
@@ -179,9 +177,10 @@ on an older day therefore can't cover a time of day at which the workload may ha
 its pod status reached storage. That window can still be covered through `Learned`, typically from
 earlier days.
 
-Every set is a union over days, so it only grows. `Learned` does not depend on `R` at all, so
-running evidence that arrives late can never invalidate it. Late evidence can only grow `Occupied`,
-which can only shrink `Covered`. The sets are bounded: past a cap (e.g. 512 intervals), `Occupied`
+`Learned` and `Vacant` are unions over days, so they only grow. `Occupied` only grows too, except
+when a retained attempt's provisional bounds are replaced by exact ones. `Learned` does not depend
+on `R` at all, so running evidence that arrives late can never invalidate it. Late evidence can only
+grow `Occupied`, which can only shrink `Covered`. The sets are bounded: past a cap (e.g. 512 intervals), `Occupied`
 merges its closest neighbors (it can only grow), and `Learned` and `Vacant` drop their shortest
 intervals (they can only shrink). Either way the result is conservative.
 
@@ -256,16 +255,20 @@ completes the profile.
    - **Per-attempt provenance.** storage keeps one record per attempt (container ID, pod, node,
      bounds, and whether the bounds are provisional or exact). An attempt first seen in pod status
      has **provisional** outward-rounded bounds. When its matching series arrives, they are replaced
-     by node-agent's exact bounds. An attempt is **final** once it has exact bounds and has ended,
-     or once it is clearly unwatched: no matching series arrived within `initialDelay` plus the
-     settle delay of its start, so its rounded bounds stand. Only final attempts are projected into
-     the grow-only `Occupied` set. Provisional and running attempts count as occupied during
-     evaluation only (`Occupied_eval`), so a rounded prefix such as `06:00:20.000–06:00:20.412` is
-     never committed for an attempt that turns out to be watched.
+     by node-agent's exact bounds, however late it arrives. No timeout declares an attempt
+     unwatched: a reporting outage can delay a watched attempt's first chunk arbitrarily.
+     Attempt records stay **reconcilable** for the same horizon storage already applies to
+     time-series data, `2 × maxSniffingTime` (the expiry after which late chunks are discarded
+     anyway). Only once an attempt is older than that horizon are its bounds frozen and folded into
+     the `Occupied` baseline. Until then, a rounded prefix such as `06:00:20.000–06:00:20.412` stays
+     replaceable. While it is in place it can only delay completion, never cause a wrong one.
 3. **Time-of-day sets.** storage keeps the three sets per profile key in its own metadata table:
    - when a segment is extended, its projection is added to `Learned`;
-   - when an attempt becomes final, or an unknown period is recorded, its projection is added to
-     `Occupied`;
+   - `Occupied` is **derived**, not accumulated: it is the frozen baseline (attempts and unknown
+     periods older than the reconciliation horizon) plus the projections of all retained attempt
+     records and unknown periods, recomputed at every evaluation. Replacing one attempt's
+     provisional bounds therefore never removes occupancy contributed by other attempts or by
+     unknown periods;
    - once absolute time becomes settled, the projection of its known not-running part is added to
      `Vacant`.
 
