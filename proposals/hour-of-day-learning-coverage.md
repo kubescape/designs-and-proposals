@@ -180,9 +180,9 @@ earlier days.
 `Learned` and `Vacant` are unions over days, so they only grow. `Occupied` only grows too, except
 when a retained attempt's provisional bounds are replaced by exact ones. `Learned` does not depend
 on `R` at all, so running evidence that arrives late can never invalidate it. Late evidence can only
-grow `Occupied`, which can only shrink `Covered`. The sets are bounded: past a cap (e.g. 512 intervals), `Occupied`
-merges its closest neighbors (it can only grow), and `Learned` and `Vacant` drop their shortest
-intervals (they can only shrink). Either way the result is conservative.
+grow `Occupied`, which can only shrink `Covered`. The sets are bounded: past a cap (e.g. 512
+intervals), `Occupied` merges its closest neighbors (it can only grow), and `Learned` and `Vacant`
+drop their shortest intervals (they can only shrink). Either way the result is conservative.
 
 ### Learning segments
 
@@ -260,9 +260,9 @@ ones (see Non-goals). Whether coverage should later be allowed to upgrade an exp
    report. Its row is recorded with `hasData=false` and its payload is not stored or merged, since
    it carries no new behavior.
 2. **Running intervals.** A pod informer (one per cluster, keeping only metadata, `spec.nodeName`
-   and `status.containerStatuses`) records container attempts per workload instance and container name. It uses each pod's
-   `ownerReferences` to find the instance, and works the same way for ReplicaSets, StatefulSets,
-   DaemonSets and Jobs, including terminating pods.
+   and `status.containerStatuses`) records container attempts per workload instance and container
+   name. It uses each pod's `ownerReferences` to find the instance, and works the same way for
+   ReplicaSets, StatefulSets, DaemonSets and Jobs, including terminating pods.
    - Attempts with a matching series (by container ID) take node-agent's lifetime bounds; all others
      take outward-rounded pod-status times.
    - A node informer tracks the `Ready` condition. storage's ClusterRole already allows
@@ -307,8 +307,9 @@ ones (see Non-goals). Whether coverage should later be allowed to upgrade an exp
      informer wasn't watching falls under `U`;
    - no attempt record of the profile key overlaps `[a, b]`.
 
-   Only recent absolute-time evidence (segments and running intervals not yet projected and
-   settled) needs to be kept, so storage doesn't keep an unbounded history.
+   Absolute-time evidence is kept only for the reconciliation horizon (`2 × maxSniffingTime`).
+   Older evidence lives on only as the time-of-day sets and the `Occupied` baseline, so storage
+   never keeps an unbounded history.
 4. **Learned-time union (only for `T > 24h`).** `L` is also kept as a list of disjoint
    `[start, end)` ranges. Overlapping or touching ranges are coalesced, so overlapping replicas
    aren't double-counted (00:00–12:00 plus 06:00–18:00 is 18h, not 24h). It is updated in the
@@ -317,8 +318,8 @@ ones (see Non-goals). Whether coverage should later be allowed to upgrade an exp
    can only under-count.
 5. **Evaluation and completion.** Storage evaluates the completion rule on **every consolidation
    pass**, for every profile key in `learning` with `T ≥ 24h`. That is where segments are extended
-   and rows are deleted anyway, so the evidence is current and no extra trigger is needed. When it holds, storage sets the
-   consolidated profile to `completed`/`full`. From then on:
+   and rows are deleted anyway, so the evidence is current and no extra trigger is needed. When it
+   holds, storage sets the consolidated profile to `completed`/`full`. From then on:
    - `PreSave` rejects new reports, and node-agent stops each container still learning on its next
      report (`ObjectCompletedError`), as it does today when another replica completes first;
    - consolidation treats the profile as frozen and reclaims leftover rows, as today.
