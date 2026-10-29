@@ -108,8 +108,8 @@ learning reached 24h, all 31 stage ReplicaSets had never been observed between 2
 - **Learned slot**: a slot that lies entirely within a *covered interval* of some series of the
   profile key. A covered interval runs from the series' watch start to its latest linked report,
   or between two linked reports.
-- **Empty slot**: a slot during which the profile's workload instance had **zero** pods (its
-  `status.replicas == 0`) for the entire slot.
+- **Empty slot**: a slot during which the profile's workload instance had **zero** pods for the
+  entire slot, according to the per-kind signal defined in "Empty-slot accounting" below.
 - **Covered slot** = learned slot OR empty slot.
 
 ### Completion rule
@@ -132,22 +132,55 @@ Completion still happens through node-agent's final report. The rule only change
    collapsed row loses the chain's first timestamp.
 2. **Learned-slot accounting.** At consolidation, for every collapsed continuous row of a series,
    storage ORs the slots fully inside `[learning-start or last accounted report, ReportTimestamp]`
-   into the profile's learned mask. It also adds the interval to the learned wall-clock union
-   (needed only for `T > 24h`). Accounting is done before rows are deleted.
-3. **Empty-slot accounting.** A ReplicaSet/StatefulSet/DaemonSet/Job informer (one per cluster,
-   not per profile) records, per workload instance, the intervals with `status.replicas == 0`. At
-   consolidation storage ORs the fully empty slots into the profile's empty mask.
+   into the profile's learned mask. Slots are half-open: slot `i` is
+   `[i × 15m, (i + 1) × 15m)`.
+3. **Learned-time union (only needed for `T > 24h`).** storage keeps the exact union of covered
+   intervals as a list of disjoint `[start, end)` ranges in its own metadata table, next to the
+   profile, not in an annotation. Each new interval is merged into the list (overlapping or touching
+   ranges are coalesced). The list is updated **in the same transaction** that deletes the
+   consolidated time-series rows, so a crash can neither drop nor double-count an interval. Summing
+   independent intervals would double-count overlapping replicas (00:00–12:00 and 06:00–18:00 are
+   18h, not 24h). The list is bounded: past a cap (e.g. 256 ranges) the shortest ranges are dropped,
+   which can only under-count.
+4. **Empty-slot accounting.** One informer per kind (per cluster, not per profile) records, per
+   workload instance, the intervals in which it had no pods:
+
+   | Owner kind | Empty when |
+   |---|---|
+   | ReplicaSet | `status.replicas == 0` |
+   | StatefulSet | `status.replicas == 0` |
+   | DaemonSet | `status.currentNumberScheduled == 0` and `status.numberMisscheduled == 0` |
+   | Job | `status.active == 0` (and the Job not yet started, or finished) |
+   | anything else | never empty |
+
    `status.replicas` counts pods that exist, including pending ones, so a slot counts as empty only
-   when no pod of that workload instance existed.
-4. **Exposed on the consolidated profile metadata** (annotations, so they're readable without the
+   when no pod of that workload instance existed. A slot counts as empty only if the informer was
+   synced and watching for the **whole** slot. A missing field, an unknown kind, or a gap in the
+   informer (storage restart, resync) leaves the slot not empty. At consolidation storage ORs the
+   fully empty slots into the profile's empty mask.
+5. **Exposed on the consolidated profile metadata** (annotations, so they're readable without the
    spec):
-   - `kubescape.io/learned-slots`: base64 of the 96-bit mask (16 bytes);
-   - `kubescape.io/empty-slots`: base64 of the 96-bit mask;
-   - `kubescape.io/learned-seconds`: union of learned time, only when needed for `T > 24h`;
+   - `kubescape.io/learned-slots` and `kubescape.io/empty-slots`: each 96-bit mask is 12 raw bytes,
+     encoded with standard base64 (RFC 4648 §4, with padding), which is always exactly 16
+     characters with no `=`. Slot `i` (UTC `[i × 15m, (i + 1) × 15m)`) is bit `7 - (i mod 8)` of
+     byte `i / 8`, i.e. most significant bit first: slot 0 (00:00–00:15) is the high bit of byte 0.
+   - `kubescape.io/learned-seconds`: the size of the learned-time union (informational; the exact
+     union lives in storage's metadata table);
    - `kubescape.io/full-observed: "true"` once condition 2 holds.
-5. **Optional safety net.** When accepting a final `completed` report for a profile whose masks are
-   not full and whose series is shorter than `T`, storage stamps completion `partial` rather than
-   `full`. This protects against a misbehaving or very old node-agent.
+6. **Mandatory completion gate.** When a final `completed` report arrives from a series that
+   carries `kubescape.io/learning-start` (i.e. from a node-agent that implements this proposal), and
+   the series learned for less than `T`, storage completes the profile **only if** all three
+   conditions of the completion rule hold *after* merging that report: masks full, `full-observed`
+   set, and for `T > 24h` the union at least `T`. Otherwise the report's data is merged and the
+   profile stays `learning`.
+
+   This closes the case where a `partial` series (a container found after a node-agent restart)
+   fills the last slots: its report is merged, but cannot complete the profile until some full
+   observation exists.
+
+   **Legacy reports** without `kubescape.io/learning-start` come from node-agents that don't
+   implement this proposal and always learn for the full `T`. storage applies today's rule to them
+   unchanged, so mixed and old clusters behave as they do now.
 
 ### node-agent changes
 
@@ -157,15 +190,21 @@ Completion still happens through node-agent's final report. The rule only change
    (a metadata-only read) and compute:
 
    ```
-   uncovered = all slots not in (learned | empty)
-   if !fullObserved and this container is a full observation: uncovered is unchanged
-   deadline  = end of the last uncovered slot, walking forward from the first slot that starts
-               after now, over the next 24h (a slot already in progress is not observable and
-               maps to tomorrow's occurrence)
-   if uncovered is empty: deadline = now + floor   (floor: e.g. 2 × updateDataPeriod, to send at
-                                                    least one linked report)
-   if T > 24h: deadline = max(deadline, now + (T - learnedSeconds))
-   timer = deadline - now   (never more than T, i.e. never longer than today)
+   if !fullObserved and this container is partial:
+       timer = T                                   # it cannot satisfy condition 2
+   else:
+       uncovered = all slots not in (learned | empty)
+       deadline  = end of the last uncovered slot, walking forward over the next 24h from the
+                   first slot with slotStart >= watchStart (slots are half-open; a slot that
+                   started before watchStart is not fully observable and maps to tomorrow's
+                   occurrence)
+       if uncovered is empty: deadline = now + floor   # floor: e.g. 2 × updateDataPeriod, to
+                                                       # send at least one linked report
+       if T > 24h: deadline = max(deadline, now + (T - learnedSeconds))
+       timer = min(deadline - now, T)              # never longer than today
+
+   A container that is a full observation sets condition 2 itself, so for it fullObserved does not
+   matter.
    ```
 
    If the profile does not exist, can't be read, or has no masks (old storage), use `T` (today's
@@ -243,9 +282,10 @@ What it does **not** guarantee, same as today:
 1. **Metadata-only read.** What is the cheapest way for node-agent to read the four annotations
    when a container starts: a dedicated subresource, a field selector, or the profile cache it
    already maintains? It should be one read per container start, not per report.
-2. **Empty-slot source.** Is `status.replicas == 0` on the owning workload instance the right
-   signal for StatefulSets, DaemonSets and Jobs? DaemonSet pods may not be scheduled on every node;
-   `status.currentNumberScheduled` might fit better.
+2. **Empty-slot signals.** Are the per-kind signals in "Empty-slot accounting" right? A DaemonSet
+   is never really "scaled to zero", so it may be simpler to treat DaemonSets as never empty.
+   Would deriving empty intervals from the pods owned by each workload instance be more robust than
+   reading workload status?
 3. **Leader-elected jobs.** Should a slot count as learned only when *all* running replicas were
    watched during it? That's stricter, and it needs per-slot replica counts.
 4. **Carry-over across ReplicaSets with an identical image.** A rollout that changes only
