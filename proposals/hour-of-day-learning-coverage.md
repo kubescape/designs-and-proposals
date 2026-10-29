@@ -12,12 +12,12 @@ exits cleanly. Long-running workloads whose containers rarely live that long —
 scale-to-zero, spot-node churn, frequent rollouts — stay in `Learning` forever, even though storage
 has already merged many hours of behavior from their containers into the profile.
 
-This proposal changes **how long node-agent learns a new container**, not who completes the
-profile. Storage records, for every moment of the UTC day, whether the workload has been learned
-at that time of day, or has never run at that time of day. When node-agent starts watching a
-container, it reads that record and learns only until the remaining uncovered times of day have
-passed. Completion still happens the way it does today: node-agent sends the container's last
-time-series profile with status `completed`.
+This proposal lets **storage** complete such a profile once, for every moment of the UTC day, the
+workload has either been learned at that time of day or has never run at that time of day — no
+matter how many containers it took. Storage already holds the merged profile, the report chains of
+every container, and a Kubernetes client, so it has everything needed. node-agent only adds one
+annotation (`kubescape.io/learning-start`); its learning timer is unchanged. When storage completes
+a profile, containers still learning are stopped through the existing "already completed" path.
 
 The rule keeps the guarantee that motivates the 24h default: **every time of day at which the
 workload ran has been observed**, so daily jobs inside the workload (a nightly cleanup, a cron
@@ -56,10 +56,9 @@ learning reached 24h, all 31 stage ReplicaSets had never been observed between 2
 
 - Complete a profile once every time of day at which the workload ran has been observed, whether
   by one container or several.
-- Keep node-agent as the only component that declares a profile `completed`, through the existing
-  final time-series report, and keep storage's existing continuity check on that report.
+- Keep the change in storage, with node-agent's learning logic untouched.
 - Be conservative under missing information: when in doubt, keep learning.
-- Be backward compatible in both directions of version skew.
+- Be backward compatible in both directions of version skew, with no new completion protocol.
 
 ## Non-goals
 
@@ -67,9 +66,10 @@ learning reached 24h, all 31 stage ReplicaSets had never been observed between 2
 - Carrying learning across ReplicaSets (a new pod template means a new profile, as today). See
   Open questions.
 - Changing what is learned, how profiles are merged, or how `failed` / `too_large` are handled.
-- Changing completion on a clean container exit (exit code 0), which is how run-to-completion
-  workloads (Jobs) complete today.
-- Changing behavior when a learning period **shorter** than 24h is configured (cluster-wide or via
+  Coverage completion only applies to a profile whose status is `learning`.
+- Changing completion after the full learning period or on a clean container exit (exit code 0),
+  which is how run-to-completion workloads (Jobs) complete today.
+- Changing behavior when a learning period **shorter** than 24h is in effect (cluster-wide or via
   the `kubescape.io/max-sniffing-time` pod label): the user has explicitly opted out of daily
   coverage, and the current single-container rule stays.
 
@@ -78,25 +78,30 @@ learning reached 24h, all 31 stage ReplicaSets had never been observed between 2
 - **node-agent** (`pkg/containerprofilemanager/v1`):
   - When it starts watching a container, `addContainer` arms
     `time.AfterFunc(calculateSniffingTime(container), handleContainerMaxTime)`.
-    `calculateSniffingTime` returns exactly `maxSniffingTimePerContainer` (never jittered,
-    see kubescape/node-agent#1060), or the value of the `kubescape.io/max-sniffing-time` pod label.
+    `calculateSniffingTime` returns exactly `maxSniffingTimePerContainer` (never jittered), or the
+    value of the `kubescape.io/max-sniffing-time` pod label. The effective value is reported on
+    every chunk as the learning-period label (`objectcache.GetLabels`).
   - Every `updateDataPeriod` (default 10m) it sends a time-series `ContainerProfile` chunk. Each
-    chunk carries a series ID (one per watched container), `ReportTimestamp` and
-    `PreviousReportTimestamp`.
+    chunk carries a series ID (one per watched container), `ReportTimestamp`,
+    `PreviousReportTimestamp`, and a completion annotation: `full` when node-agent watched the
+    container from its start, `partial` otherwise (for example, after a node-agent restart).
   - A chunk with nothing new is **skipped**, and the chain links only to reports actually sent. So
     two consecutive linked reports prove the container was watched continuously between them,
     including idle time.
   - It sends a final report (`forceSend`):
     - when the timer expires, with status `completed`;
-    - when the container exits, with status `completed` for exit code 0 and `failed` otherwise
-      (`removeContainer`, via `objectcache.GetTerminationExitCode`).
-  - When storage answers with "already completed", node-agent stops learning that container.
+    - when the container exits, with status `completed` for exit code 0 and `failed` otherwise.
+  - When storage rejects a report because the profile is already completed (`ObjectCompletedError`),
+    node-agent marks the container completed and stops learning it. This is how other replicas
+    stop today once one replica completes the profile.
 - **storage** (`pkg/registry/file/containerprofile_processor.go`):
   - Time-series chunks are recorded in the `time_series` table and consolidated periodically into
-    the profile. `consolidateContinuousTimeSeries` collapses a linked chain into one row.
+    the profile. `consolidateContinuousTimeSeries` collapses a linked chain into one row, keeping
+    only its latest `ReportTimestamp`.
   - `updateProfileStatus` marks the profile `completed` from a single series with no gap
-    (`PreviousReportTimestamp` back to zero) whose last status is `completed`. It does not check
-    how long that series learned. `SetCompletedStatus` copies `full`/`partial` from that series.
+    (`PreviousReportTimestamp` back to zero) whose last status is `completed`.
+  - `PreSave` rejects reports for a profile that is already `completed`/`full`. Consolidation of a
+    frozen profile reclaims leftover rows.
   - Series with no report for `2 × maxSniffingTime` are expired and finalized as
     `completed`/`partial`. Workloads that keep starting new containers never reach this.
   - storage runs an in-cluster `kubernetes.Interface` client (`pkg/apiserver/apiserver.go`).
@@ -133,8 +138,8 @@ state was unknown, is used immediately, because it can only make the result more
 Evidence that it **did not run** is used only once settled, because a status update still in flight
 could contradict it.
 
-From the evidence, storage maintains three **time-of-day sets**, each a list of disjoint intervals
-over `[00:00, 24:00)` with millisecond endpoints:
+From the evidence, storage maintains three **time-of-day sets** per profile key, each a list of
+disjoint intervals over `[00:00, 24:00)` with millisecond endpoints:
 
 | Set | Contains time of day `τ` when, on some day, … | Rounding |
 |---|---|---|
@@ -145,190 +150,120 @@ over `[00:00, 24:00)` with millisecond endpoints:
 The time of day that is **covered** is
 
 ```
-Covered = Learned ∪ (Vacant \ Occupied)
+Covered = Learned ∪ (Vacant \ Occupied_eval)
+Occupied_eval = Occupied ∪ projection of [now - settle delay, now]
 ```
 
 So a time of day is covered either because the workload was watched at that exact time on some
 day, or because it has **never** been seen running at that time and has been seen not running there
-at least once.
+at least once. The recent, not yet settled window counts as occupied when evaluating. Vacancy seen
+on an older day therefore can't cover a time of day at which the workload may have just run, before
+its pod status reached storage. That window can still be covered through `Learned`, typically from
+earlier days.
 
 Every set is a union over days, so it only grows. `Learned` does not depend on `R` at all, so
 running evidence that arrives late can never invalidate it. Late evidence can only grow `Occupied`,
-which can only shrink `Covered`, and the completion gate re-evaluates `Covered` when it runs.
-
-The gate evaluates coverage **as of the final report**, not as of the moment storage processes it.
-Its cutoff is the final report's `ReportTimestamp`. Evidence about absolute time after the cutoff is
-ignored. This matters because the completing container keeps running after it stops learning, and
-that running must not count against it. The
-window `[cutoff - settle delay, cutoff]` is treated as occupied
-(`Occupied_gate = Occupied ∪ projection of that window`). So vacancy seen on an older day can't
-cover a time of day at which the workload may have just run, before its pod status reached storage,
-and processing delay in storage changes nothing. Times of day in that window are covered only
-through `Learned`. node-agent guarantees they are: every shortened timer lasts at least the settle
-delay (see "node-agent changes"), so the completing container was watched throughout
-`[cutoff - settle delay, cutoff]`. The
-sets are bounded: past a cap (e.g. 512 intervals), `Occupied` merges its closest neighbors (it can
-only grow), and `Learned` and `Vacant` drop their shortest intervals (they can only shrink). Either
-way the result is conservative.
-
-### Completion rule
-
-For an effective learning period `T ≥ 24h`, a profile may be completed **through coverage** when:
-
-1. `Covered` is the whole day `[00:00, 24:00)`, evaluated on settled evidence, **and**
-2. at least one contributing series was a full observation (node-agent watched the container from
-   its start, completion `full`), so start-up behavior is in the profile, **and**
-3. for `T > 24h`, the total learned wall-clock time (union of learning segments, not their sum) is
-   at least `T`.
-
-For `T < 24h` nothing changes. Completion on timer expiry after the full `T`, and on a clean exit,
-also stay exactly as today.
+which can only shrink `Covered`. The sets are bounded: past a cap (e.g. 512 intervals), `Occupied`
+merges its closest neighbors (it can only grow), and `Learned` and `Vacant` drop their shortest
+intervals (they can only shrink). Either way the result is conservative.
 
 ### Learning segments
 
 A **learning segment** is a maximal interval during which one series is verifiably watched:
 
-- If the series' first report links back to nothing, it starts at the series' **watch start**, a
-  new `kubescape.io/learning-start` annotation that node-agent puts on every chunk. For a `full`
-  series, node-agent caught the container at creation, before its process ran, so the segment
-  starts at the container's start (`state.running.startedAt`, rounded down) when that is earlier.
-  Otherwise a container that is watched from its very start would leave a sub-second unlearned gap
-  at every start.
+- If the series' first report links back to nothing, it starts at the series' **watch start**, the
+  new `kubescape.io/learning-start` annotation (see "node-agent change"). For a `full` series,
+  node-agent caught the container at creation, before its process ran, so the segment starts at the
+  container's start (`startedAt`, rounded down) when that is earlier. Without this, every container
+  start would leave a short unlearned gap. A workload that scales up at the same time every day
+  would leave that gap at the same time of day, and never complete.
 - After a broken link, it starts at the `ReportTimestamp` of the first report after the gap: data
   between a missing report and its successor is lost, so that time isn't credited.
+- It is extended to the `ReportTimestamp` of every report that links to its predecessor.
 - When a series ends with its container's exit, node-agent watched the container until it
   finished. So its last segment ends at the container's `finishedAt` (rounded up) when that is
-  later than the final `ReportTimestamp`. This mirrors the start rule: running intervals are rounded
-  outward, and a container watched for its whole life must not leave sub-second unlearned slivers
-  at its start or end.
-- It is extended to the `ReportTimestamp` of every report that links to its predecessor.
-- A broken link closes it.
+  later than the final `ReportTimestamp`. Like the start rule, this keeps a container watched for
+  its whole life from leaving sub-second unlearned slivers.
+- A broken link closes a segment.
 
-Today the collapsed row keeps only the chain's latest `ReportTimestamp`. storage therefore persists,
-per active series, the current segment's `[start, end]` and the last linked `ReportTimestamp`
-across consolidation passes. This lets reports consolidated in different passes (at 00:10, 00:20
-and 00:30, say) extend one 30-minute segment instead of producing three disjoint fragments.
+Because the collapsed row keeps only the chain's latest `ReportTimestamp`, storage persists, per
+active series, the current segment's `[start, end]` and the last linked `ReportTimestamp` across
+consolidation passes. Reports consolidated in different passes (at 00:10, 00:20 and 00:30, say)
+therefore extend one 30-minute segment instead of producing three disjoint fragments.
+
+### Completion rule
+
+For a profile key in status `learning` whose effective learning period `T` (from the chunks'
+learning-period label) is at least 24h, storage completes the profile when:
+
+1. `Covered` is the whole day `[00:00, 24:00)`, **and**
+2. at least one contributing series was a full observation (completion `full`), so start-up
+   behavior is in the profile, **and**
+3. for `T > 24h`, the total learned wall-clock time (union of learning segments, not their sum) is
+   at least `T`.
+
+Completing means setting the consolidated profile to `completed`/`full`, derived from these
+conditions rather than copied from any one series. The existing completion paths (a series
+completing after the full `T`, a clean exit, expiry) are unchanged. Whichever comes first
+completes the profile.
 
 ### Storage changes
 
-1. **Record watch start.** Read `kubescape.io/learning-start` from chunks, and persist segment
-   boundaries per series as described above.
+1. **Learning segments.** Read `kubescape.io/learning-start` and the completion annotation from
+   chunks, and build and persist segments as described above.
 2. **Running intervals.** A pod informer (one per cluster, metadata and `status.containerStatuses`
    only) records `R` per workload instance and container name, using each pod's `ownerReferences`
    to find the instance. This works the same way for ReplicaSets, StatefulSets, DaemonSets and
    Jobs, and includes terminating pods. Informer gaps (storage restart, watch expiry before resync)
-   are recorded as unknown.
-3. **Time-of-day evaluation.** storage keeps `R`, `U` and `L` **dated**, in absolute time, for a
-   bounded look-back window (e.g. `2 × T`) in its own metadata table. Evidence older than the
-   window is folded into an undated **baseline**: the projections of everything before the window
-   start, kept as the same three time-of-day sets. The gate's sets for a cutoff `c` are the
-   baseline plus the projections of dated evidence about times `≤ c`. This is exact as long as `c`
-   is inside the window. A cutoff older than the window start can't be reconstructed, so the gate
-   rejects it and the profile stays `learning`. That can't happen in practice: a final report is
-   processed within minutes, and the window is days. When a segment is extended, it adds
-   its projection to `Learned` straight away. When running or unknown evidence arrives, it adds its
-   projection to `Occupied` straight away. Once absolute time becomes settled, it adds the
-   projection of its known not-running part to `Vacant`. Evidence that arrives late, for example the next
-   report of an idle container, still extends `Learned` for the time it now covers.
-4. **Learned-time union (only for `T > 24h`).** `L` is kept as a list of disjoint `[start, end)`
-   ranges in the same metadata table. Overlapping or touching ranges are coalesced, so overlapping
-   replicas aren't double-counted (00:00–12:00 plus 06:00–18:00 is 18h, not 24h). It is updated in
-   the **same transaction** that deletes the consolidated time-series rows, so a crash can neither
-   drop nor double-count an interval. Past a cap (e.g. 256 ranges) the shortest ranges are dropped,
-   which can only under-count.
-5. **Exposed on the consolidated profile metadata** (annotations, readable without the spec):
-   - `kubescape.io/covered-minutes`: a conservative per-minute view of `Covered`, used only to
-     size node-agent's timer. Bit `m` is set when the whole minute `[m, m + 1min)` lies inside
-     `Covered`. The 1440 bits = 180 raw bytes are encoded with standard base64 (RFC 4648 §4, with
-     padding), which is always exactly 240 characters with no `=`. Minute `m` is bit
-     `7 - (m mod 8)` of byte `m / 8`, most significant bit first: minute 0 (00:00–00:01) is the
-     high bit of byte 0.
-   - `kubescape.io/coverage-evaluated-at`: when storage last evaluated `Covered` (RFC 3339);
-   - `kubescape.io/full-observed: "true"` once condition 2 holds;
-   - `kubescape.io/learned-seconds`: size of the learned-time union (informational).
+   are recorded as `U`.
+3. **Time-of-day sets.** storage keeps the three sets per profile key in its own metadata table:
+   - when a segment is extended, its projection is added to `Learned`;
+   - when running or unknown evidence arrives, its projection is added to `Occupied`;
+   - once absolute time becomes settled, the projection of its known not-running part is added to
+     `Vacant`.
 
-   The time-of-day sets stay internal to storage. The completion gate uses them exactly, never the
-   per-minute view.
-6. **Completion gate.** A container whose timer was shortened by this proposal ends with a **new
-   final status, `coverage-completed`**, instead of `completed`. Every other final report
-   (`completed` after the full `T`, `completed` on a clean exit, `failed`) is handled exactly as
-   today, and so are reports from node-agents that don't implement this proposal.
+   Only recent absolute-time evidence (segments and running intervals not yet projected and
+   settled) needs to be kept, so storage doesn't keep an unbounded history.
+4. **Learned-time union (only for `T > 24h`).** `L` is also kept as a list of disjoint
+   `[start, end)` ranges. Overlapping or touching ranges are coalesced, so overlapping replicas
+   aren't double-counted (00:00–12:00 plus 06:00–18:00 is 18h, not 24h). It is updated in the
+   **same transaction** that deletes the consolidated time-series rows, so a crash can neither drop
+   nor double-count an interval. Past a cap (e.g. 256 ranges) the shortest ranges are dropped, which
+   can only under-count.
+5. **Evaluation and completion.** During each consolidation pass, for every profile key in
+   `learning` with `T ≥ 24h`, storage evaluates the completion rule. When it holds, storage sets the
+   consolidated profile to `completed`/`full`. From then on:
+   - `PreSave` rejects new reports, and node-agent stops each container still learning on its next
+     report (`ObjectCompletedError`), as it does today when another replica completes first;
+   - consolidation treats the profile as frozen and reclaims leftover rows, as today.
+6. **Visibility** (annotations on the consolidated profile, informational):
+   - `kubescape.io/coverage-ratio`: share of the day covered, e.g. `0.93`;
+   - `kubescape.io/completion-source: coverage` when this rule completed the profile.
 
-   For a `coverage-completed` report, storage merges the data first, re-evaluates the sets, and
-   completes the profile **only if** all three conditions of the completion rule hold on settled
-   evidence. Otherwise the data is kept and the profile stays `learning`.
+### node-agent change
 
-   This closes the case where a `partial` series (a container found after a node-agent restart)
-   fills the last gaps: its data counts, but it cannot complete the profile until some full
-   observation exists. It also makes the protocol safe against storage that doesn't implement it
-   (see "Compatibility and rollout").
-7. **Aggregate completion state.** When a `coverage-completed` report passes the gate, storage sets
-   the aggregate profile to `completed`/`full`. That state is derived from `full-observed` and
-   coverage, not copied from the final series as `SetCompletedStatus` does today. A gate-passing
-   completion delivered by a `partial` series still freezes consolidation and rejects further
-   reports, like any `completed`/`full` profile. The series' own row keeps its `partial`
-   completion.
+Add `kubescape.io/learning-start` (the time node-agent started watching the container, RFC 3339
+with sub-second precision) to every chunk. That is the only change: the learning timer, the final
+reports and the handling of `ObjectCompletedError` stay as they are.
 
-### node-agent changes
-
-1. **Annotate chunks** with `kubescape.io/learning-start`.
-2. **Compute the timer from coverage.** In `calculateSniffingTime`, when the effective `T ≥ 24h`
-   and the profile key's consolidated profile exists and is still learning, read
-   the coverage annotations with a metadata-only read. If `coverage-evaluated-at` is missing or
-   older than a freshness bound (e.g. 3 × the consolidation interval), the coverage is ignored and
-   the timer is `T`. Otherwise:
-
-   ```
-   if !fullObserved and this container is partial:
-       timer = T                                   # it cannot satisfy condition 2
-   else:
-       uncovered = minutes of day not in covered
-       deadline  = end of the last uncovered minute, walking forward over the next 24h through
-                   occurrences that start at or after watchStart. An uncovered minute that
-                   started before watchStart can't be fully watched today, so it maps to its
-                   next-day occurrence (12:34 with watchStart 12:34:30 counts as tomorrow's
-                   12:34; one that starts exactly at watchStart counts today)
-       if uncovered is empty: deadline = now
-       deadline = max(deadline, now + floor)   # floor = settle delay + updateDataPeriod, for EVERY
-                                               # shortened timer: the gate treats the last settle
-                                               # delay before the final report as occupied, so this
-                                               # container must have been watched through all of
-                                               # it, with at least one linked report
-       if T > 24h: deadline = max(deadline, now + (T - learnedSeconds))
-       timer = min(deadline - now, T)              # never longer than today; when the cap
-                                                   # applies the container ends with
-                                                   # `completed` after the full T
-   final status on expiry = (timer < T) ? coverage-completed : completed
-   ```
-
-   A container that is a full observation sets condition 2 itself, so for it `fullObserved` does
-   not matter. If the profile does not exist or can't be read, the timer is `T` (today's behavior).
-3. **Optional refresh.** Re-read the annotations periodically (e.g. hourly) and shorten the timer if
-   other replicas covered the remaining minutes. Without it, completion still happens: the
-   longest-running replica's own timer completes the profile, and the others stop on "already
-   completed".
-
-If storage's gate rejects a `coverage-completed` report (for example because new running evidence entered `Occupied` in
-the meantime), node-agent has already stopped learning that container. The next container to start
-reads the updated coverage and learns through the remaining minutes. An optional improvement is for
-node-agent to re-arm instead of stopping when the gate rejects. Because `covered-minutes` is
-conservative (a minute is set only when it is entirely covered), node-agent's timer never ends
-before the exact gate could pass, except when new `Occupied` evidence arrives in the meantime.
+The annotation is needed because storage can't derive the watch start on its own. A chunk
+identifies the workload instance and container name, but not the pod, so storage can't match it to
+a pod's `startedAt`.
 
 ### Why this guarantees the daily cycle
 
-Take any time of day `τ` at which the workload runs a daily job. When the profile completes through
-coverage, `τ ∈ Covered` on settled evidence, so either:
+Take any time of day `τ` at which the workload runs a daily job. When storage completes a profile
+through coverage, `τ ∈ Covered`, so either:
 
 - `τ ∈ Learned`: on some day, a container of this exact pod template was being watched without a
   gap **at that exact time of day**. If the job ran then, its execs, file opens, syscalls and
   network peers were recorded. Watching a neighboring moment is not enough: observing
   02:00:00–02:00:10 says nothing about 02:00:45; or
-- `τ ∈ Vacant \ Occupied`: on **no** settled day did the container run at `τ` (or was its state
-  unknown there), and on some day it was seen not running there. So the job has never run at that
-  time of day for this workload instance. Empty evidence can't hide a time of day at which the
-  workload ran unobserved: one unlearned running occurrence puts `τ` in `Occupied` for good. Only
-  `Learned` can then cover it.
+- `τ ∈ Vacant \ Occupied_eval`: on **no** day did the container run at `τ` (or was its state
+  unknown there), including the recent unsettled window, and on some settled day it was seen not
+  running there. So the job has never run at that time of day for this workload instance. Empty
+  evidence can't hide a time of day at which the workload ran unobserved: one unlearned running
+  occurrence puts `τ` in `Occupied` for good. Only `Learned` can then cover it.
 
 A single container learning 24h puts the whole day in `Learned`, so the rule is a strict
 generalization of today's. It relaxes exactly one requirement: that the whole day be observed by
@@ -347,114 +282,105 @@ What it does **not** guarantee, same as today:
 - **Nightly scale-to-zero (06:00–20:00 UTC up), pod informer synced throughout.**
   - Day 1: a container starts at 06:00:20, is watched for its whole life, and stops at 20:00:05.
     `Learned` gets 06:00:20–20:00:06 (start and end rounded outward, like `Occupied`). Nothing runs
-    overnight, so once settled, 20:00:06–06:00:20 goes into `Vacant` and never into `Occupied`. By
-    the next morning the whole day is covered.
-  - Day 2: the new container starts at ~06:00, reads a full `covered-minutes`, arms the floor timer
-    (settle delay + one report period, ~20 minutes), and completes the profile around 06:20 with
-    `coverage-completed`. Today it never completes.
+    overnight, so as the night settles, 20:00:06 onwards goes into `Vacant` and never into
+    `Occupied`.
+  - Day 2: a new container starts at 06:00:15 and is learned from there. By ~06:10:15 the night up
+    to 06:00:15 has settled as vacant, so the whole day is covered. The next consolidation pass
+    completes the profile, and the container stops learning on its next report. Today it never
+    completes.
 - **Spot churn, replicas overlapping around the clock.** Time of day goes into `Learned` as soon
   as some replica is watched at that time on some day. Typically the whole day is learned within
   ~24h of wall-clock time, instead of needing one container to survive 24h.
-- **Single long-lived container.** Nothing is covered at its start, so the timer is `T` and it ends
-  with `completed`. That is exactly today's behavior.
+- **Single long-lived container.** The whole day becomes `Learned` at the same moment its 24h
+  timer fires, so it completes exactly as today, through whichever path runs first.
 - **Ran unobserved once.** The workload ran at 02:00 on one night, on a node where node-agent was
   down, and was empty at 02:00 on every other night. 02:00 is in `Occupied`, so the vacant nights
-  can't cover it. The profile waits until a container is watched at 02:00.
+  can't cover it. The profile waits until a container is watched at 02:00, or until today's 24h
+  rule completes it.
 
 ## Compatibility and rollout
 
-- **Feature flag on both sides**, default off at first: node-agent
-  `learningCoverage.enabled`, storage `containerProfileCoverage.enabled`.
-- **Old node-agent + new storage:** reports never carry `coverage-completed`, so storage applies
-  today's rule, and the node-agent timer is `T`, as today.
-- **New node-agent + old storage:** there is no coverage annotation, so the timer is `T` and the
-  container ends with `completed`. As today.
-- **Downgrading storage (or turning its flag off) while node-agents still have shortened timers
-  armed:** old storage doesn't know `coverage-completed`. Its `updateProfileStatus` treats any
-  status other than `completed` and `failed` as learning (the `default` branch), so such reports
-  are merged as data and **cannot** complete a profile without the gate. Coverage annotations left
-  behind by newer storage go stale: `coverage-evaluated-at` stops advancing, and node-agent falls
-  back to `T` once it is past the freshness bound. The worst case during a downgrade is that some
-  containers stop learning early and their profiles complete later. A profile can never complete
-  wrongly. No drain or reset step is required.
-- **Mixed node-agents in one cluster:** each container uses its own node-agent's rule. The
-  coverage evidence is shared, and completion is still first-completed-wins.
-- No change to the `ContainerProfile` spec. Only new annotations and one new final status value.
+- **Feature flag in storage only**, default off at first: `containerProfileCoverage.enabled`.
+- **Old node-agent + new storage:** chunks have no `learning-start`, so segments start at the first
+  report. Every container start then leaves a gap of up to `initialDelay` (2 minutes by default)
+  that is never learned, and workloads that start at the same time every day won't complete through
+  coverage. They complete as today. Nothing completes wrongly.
+- **New node-agent + old storage:** the annotation is ignored. As today.
+- **Downgrading storage:** profiles already completed stay completed (old storage honors
+  `completed`/`full`). Coverage evidence is no longer collected, and the rest behaves as today.
+  No new status or protocol exists that old storage could misread.
+- No change to the `ContainerProfile` spec, and no new status value. Only new annotations.
 
 ## Alternatives considered
 
 1. **Sum learned time across containers.** Rejected: it doesn't preserve the daily cycle (see
    Motivation, 31/31 stage ReplicaSets would have completed without ever observing the night).
-2. **Whole-slot accounting (e.g. quarter-hours learned or empty as a whole).** An earlier draft of
-   this proposal. Rejected: a workload that scales at 06:01 leaves the 06:00–06:15 slot partly
-   learned and partly empty forever, so it never completes. Separately, OR-ing "empty" occurrences
-   lets an empty night cover a time of day at which the workload ran unobserved on another night.
-   Exact time-of-day sets plus `Occupied` fix both.
-3. **Per-minute bitmaps with set-only bits.** Another earlier draft. Rejected: watching 10 seconds
-   of a minute marked the whole minute learned, and a set-only bit couldn't be cleared when late
-   running evidence contradicted it. Exact time-of-day sets, with `Learned` independent of `R` and
-   `R` used only once settled, avoid both. The per-minute view survives only as a conservative
-   input to node-agent's timer.
+2. **Whole-slot accounting (quarter-hours learned or empty as a whole).** An earlier draft.
+   Rejected: a workload that scales at 06:01 leaves the 06:00–06:15 slot partly learned and partly
+   empty forever, so it never completes. And OR-ing "empty" occurrences lets an empty night cover a
+   time of day at which the workload ran unobserved on another night.
+3. **Per-minute bitmaps with set-only bits.** An earlier draft. Rejected: watching 10 seconds of a
+   minute marked the whole minute learned, and a set-only bit couldn't be cleared when late running
+   evidence contradicted it.
 4. **Workload status for emptiness (`status.replicas == 0`).** Rejected: the field doesn't exist on
    DaemonSet or Job status, and on ReplicaSets it excludes terminating pods whose containers are
-   still running. Container running intervals from pod status work for every owner kind and
-   include terminating pods.
-5. **Storage stamps `completed` on its own when `Covered` is the whole day.** It works, but it adds a
-   second completion trigger that has to be reconciled with node-agent's in-memory state. Keeping
-   node-agent as the only completer reuses the existing path. storage only gates it and derives
-   the aggregate state.
+   still running.
+5. **node-agent shortens its learning timer from storage-published coverage, and storage gates the
+   resulting completion.** The previous revision of this proposal, which kept node-agent as the
+   only component that completes profiles. Rejected: it needed a lot of extra machinery to be safe.
+   - a published per-minute coverage view with a freshness check;
+   - a new final status that storage without the proposal would treat as `learning`, so that
+     downgrades couldn't complete profiles unchecked;
+   - a gate cutoff at the final report, with dated evidence to reconstruct coverage as of that
+     cutoff (the completing container keeps running after it stops learning);
+   - a minimum timer covering the settle delay.
+
+   A container stopped by a shortened timer also couldn't recover if the gate then rejected the
+   completion. Storage-side completion gets the same guarantee through the existing
+   `ObjectCompletedError` path, and containers keep learning until the profile is really complete.
 6. **Shorter learning period via the `kubescape.io/max-sniffing-time` label.** Already available
    and useful when the user accepts losing the daily guarantee. It can't help workloads that need
    the guarantee.
 
 ## Open questions
 
-1. **Metadata-only read.** What is the cheapest way for node-agent to read the annotations when a
-   container starts: a dedicated subresource, a field selector, or the profile cache it already
-   maintains? It should be one read per container start, not per report.
-2. **Pod informer cost.** A cluster-wide pod informer in storage (status only, with a transform
+1. **Pod informer cost.** A cluster-wide pod informer in storage (status only, with a transform
    that drops everything else) adds memory and apiserver watch load. Could node-agent provide the
    running intervals for the pods on its node instead? That would lose pods on nodes without a
    healthy node-agent, which the informer marks as running but unobserved.
-3. **Leader-elected jobs.** Should `Learned` require that *every* running replica was watched at a
-   time of day? That's stricter, makes `Learned` depend on `R` again (so only on settled time), and
+2. **Leader-elected jobs.** Should `Learned` require that *every* running replica was watched at a
+   time of day? That's stricter, makes `Learned` depend on `R` (so on settled time only), and
    delays completion whenever one node's node-agent lags.
-4. **Carry-over across ReplicaSets with an identical image.** A rollout that changes only
+3. **Carry-over across ReplicaSets with an identical image.** A rollout that changes only
    configuration or labels currently resets learning. Should the evidence carry over when every
    container's image digest is unchanged?
-5. **Evidence aging.** `Occupied` is permanent, so one unobserved night can delay completion
-   indefinitely if the workload never runs at that time again. Should `Occupied` and `Vacant`
-   evidence older than some window (e.g. 7 days) be dropped?
-6. **Idle-heartbeat reports.** An idle container extends its segment only when its next report or
-   its final report arrives. Should node-agent send an empty linked report at least every few
-   minutes, so `Learned` fills sooner for other replicas?
-7. **Re-arm on gate rejection.** Should node-agent keep learning when storage rejects a
-   `coverage-completed` report, rather than relying on the next container?
+4. **Evidence aging.** `Occupied` is permanent, so one unobserved night can delay coverage
+   completion until today's rule kicks in. Should `Occupied` and `Vacant` evidence older than some
+   window (e.g. 7 days) be dropped?
+5. **Idle-heartbeat reports.** An idle container extends its segment only when its next report or
+   its final report arrives, which delays (never falsifies) coverage. Should node-agent send an
+   empty linked report at least every few minutes? That would be a second, optional node-agent
+   change.
+6. **Evaluation cadence.** Is the consolidation pass the right place to evaluate, or should
+   evaluation be triggered when a profile's evidence changes?
 
 ## Testing
 
 - **storage unit tests**:
-  - segment construction across consolidation passes, split rows and broken links;
-  - time-of-day set evaluation (fragments inside a minute, transitions, terminating pods, informer
-    gaps, the asymmetric settle delay, late `L` and late `R` evidence, the interval cap);
-  - the gate's cutoff at the final `ReportTimestamp` (processing delay must not matter, running
-    after the cutoff must not count), its treatment of the window before it as occupied, and the
-    rejection of a cutoff older than the retained window;
-  - folding of expired dated evidence into the baseline;
+  - segment construction across consolidation passes, split rows, broken links, and the
+    start and end rules for full series;
+  - time-of-day set evaluation: fragments inside a minute, transitions, terminating pods, informer
+    gaps, the asymmetric settle delay and the unsettled window, late `L` and late `R` evidence, the
+    interval cap;
   - the `Occupied` block on the vacancy path;
-  - the completion gate for `coverage-completed`, other final statuses and legacy reports, and the
-    aggregate `completed`/`full` derivation for a `partial` final series;
-  - the conservative `covered-minutes` view and its encoding.
-- **Downgrade test**: a `coverage-completed` report sent to storage without this proposal leaves
-  the profile `learning`.
-- **node-agent unit tests**: timer computation, table-driven over `covered-minutes`, current time, `T`
-  and full/partial cases, including an uncovered minute already in progress at watch start, the
-  floor on every shortened timer (including a single uncovered minute next to vacancy-only
-  coverage), plus the old-storage fallback.
+  - completion: the three conditions, `T < 24h` and non-`learning` profiles left alone,
+    `completed`/`full` derivation, and rejection of later reports via `PreSave`;
+  - chunks from old node-agents without `learning-start`.
+- **node-agent unit test**: chunks carry `kubescape.io/learning-start`.
 - **Component test**: a Deployment scaled 1→0→1 on a short schedule, with an artificially shortened
-  day (minute length and day length configurable in tests). The profile must complete only after
-  the zero-replica window has been recorded as vacant, and must not complete if a replica ran
-  unobserved during it.
+  day (day length configurable in tests). The profile must complete through coverage only after
+  the zero-replica window has settled as vacant, must not complete if a replica ran unobserved
+  during it, and the running container must stop learning after completion.
 - **Telemetry**: add `coverage` attributes (learned, vacant, occupied-unlearned and uncovered
   seconds of day) to the existing `container.profile.learning` span, so the effect can be measured
   in the field the same way the motivation data was.
