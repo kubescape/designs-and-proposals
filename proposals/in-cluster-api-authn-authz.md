@@ -43,7 +43,7 @@ asking:
 |---|---|---|---|
 | kubescape | 8080 | `POST/DELETE /v1/scan`, `GET /v1/status`, `GET/DELETE /v1/results` | operator |
 | kubevuln | 8080 | `POST /v1/{generateSBOM,scanImage,scanRegistry,scanApplicationProfile}`, `GET /v1/scanStatus/{jobID}`, `GET /v1/diagnostics` | operator |
-| synchronizer | 8089 | `POST /apis/v1/kubescape.io/v1/{runtimealerts,networkstreams,nodeprofiles,registrystatuses}` | node-agent; the operator's admission exporter (`runtimealerts`, `registrystatuses`) |
+| synchronizer | 8089 | `POST /apis/v1/kubescape.io/v1/{runtimealerts,networkstreams,nodeprofiles,registrystatuses,aisandboxheartbeats}` | node-agent; the operator's admission exporter (`runtimealerts`, `registrystatuses`) |
 | operator | 4002 | `POST /v1/triggerAction` | the `kubescape operator scan` CLI command, through a port-forward |
 
 Private security reports against kubescape describe exactly this: an unauthenticated in-cluster API that lets an
@@ -237,8 +237,11 @@ needed to create the CRD by hand.
 | operator | `POST /v1/triggerAction` | `create` | `operatorcommands` (the existing CRD) |
 | operator | OpenAPI UI, readiness port, admission webhook | open (the webhook is called by kube-apiserver and has its own TLS) | |
 
-The synchronizer's URL scheme already names a group and resource, so its SAR uses the real ones; today those are
-`runtimealerts`, `networkstreams`, `nodeprofiles` and `registrystatuses` in `kubescape.io`.
+The synchronizer's URL scheme already names a group and resource, so its SAR uses the real ones. The chart's
+synchronizer configmap is the source of truth for that list; today it is `runtimealerts`, `networkstreams`,
+`nodeprofiles`, `registrystatuses` and `aisandboxheartbeats` in `kubescape.io`. Any resource added to that block in
+future needs a matching `create` rule in the caller's Role, and the chart's unit test for the Role should assert the
+two lists match.
 
 ### 6.3 Identity: audience-bound projected tokens
 
@@ -319,7 +322,8 @@ Rendered when enabled:
 - `Role` and `RoleBinding` in `ksNamespace`:
   - operator: `create`, `delete`, `get` on `scans` and `scanresults`; `create`, `get` on `vulnerabilityscans`;
     `create` on `runtimealerts` and `registrystatuses`.
-  - node-agent: `create` on `runtimealerts`, `networkstreams`, `nodeprofiles`, `registrystatuses`.
+  - node-agent: `create` on `runtimealerts`, `networkstreams`, `nodeprofiles`, `registrystatuses`,
+    `aisandboxheartbeats`.
 - The projected token volume (6.3) in the operator and node-agent pod specs, with `KS_API_TOKEN_FILE` pointing at it
   in the operator and `tokenFile` in node-agent's exporter configuration.
 - The audience as an env var in each server so the chart and the servers cannot disagree.
@@ -402,11 +406,13 @@ server checks it, and a new server rejects an old caller only until that caller'
   probes and metrics stay reachable without a token; startup exits on a failed `apiauth.New`.
 - **operator and node-agent:** requests to kubescape, kubevuln and synchronizer carry the header when the file exists
   and omit it otherwise; the 401/403 log path.
-- **Chart:** helm-unittest as in 6.5; `helm template` with `--set global.apiAuth.enabled=false`.
+- **Chart:** helm-unittest as in 6.5, including a case that every resource in the synchronizer's `httpEndpoint`
+  block has a `create` rule in the node-agent Role; `helm template` with `--set global.apiAuth.enabled=false`.
 - **End to end on kind:** fresh install, trigger a scan through an `OperatorCommand`, read results, confirm
-  Prometheus scrapes with `serviceMonitor.enabled`; `kubectl run curl` from another namespace gets 401 on each of the
-  four services; a pod with a token for a service account that has no Role gets 403; `helm upgrade` from the previous
-  chart keeps scans working; delete the operator's RoleBinding and confirm 403 within 10 seconds.
+  Prometheus scrapes with `serviceMonitor.enabled`; node-agent's runtime alerts and AI-sandbox heartbeats reach the
+  synchronizer (200, not 403); `kubectl run curl` from another namespace gets 401 on each of the four services; a pod
+  with a token for a service account that has no Role gets 403; `helm upgrade` from the previous chart keeps scans
+  working; delete the operator's RoleBinding and confirm 403 within 10 seconds.
 
 ## 10. Alternatives considered
 
