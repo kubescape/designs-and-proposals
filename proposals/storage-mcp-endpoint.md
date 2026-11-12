@@ -1,6 +1,8 @@
 # Proposal: Read-only MCP endpoint in kubescape/storage
 
-- **Status:** Proposed
+- **Status:** Implemented in storage and helm-charts (phases 1 to 3); the Kagent example (phase 4) waits for a Kagent CA
+  option. What shipped and where it differs from this design: [section 14](#14-implementation-status)
+- **Tracking:** [storage#451](https://github.com/kubescape/storage/issues/451)
 - **Author:** Sarthak Shreshtha ([@Sarthak-Shreshtha01](https://github.com/Sarthak-Shreshtha01))
 - **Date:** 2026-10-22
 - **Scope:** [`storage`](https://github.com/kubescape/storage) (endpoint, auth, limits, tools);
@@ -559,7 +561,55 @@ Phase 1a is mostly generated code; the other phases are one or two small PRs eac
 3. **Kagent CA:** wait for Kagent to enable `caCertSecretRef`, or offer to help land it upstream.
 4. **Resource name:** `mcpservers/mcp` reads clearly, but another name may fit the API group better.
 
-## 14. References
+## 14. Implementation status
+
+As of 2026-11-12. The design above is kept as accepted; this section records what shipped and where it differs.
+User documentation: [`docs/features/mcp-endpoint.md`](https://github.com/kubescape/storage/blob/main/docs/features/mcp-endpoint.md)
+in storage.
+
+| Phase | Shipped in | State |
+|---|---|---|
+| 1a | [storage#452](https://github.com/kubescape/storage/pull/452) (`MCPServer` type) | Merged |
+| 1b | [storage#456](https://github.com/kubescape/storage/pull/456) (endpoint, front-proxy check, per-tool authorizer, audit line, first tool) | Merged |
+| 2 | Tools: [storage#460](https://github.com/kubescape/storage/pull/460), [#472](https://github.com/kubescape/storage/pull/472), [#474](https://github.com/kubescape/storage/pull/474), [#480](https://github.com/kubescape/storage/pull/480). Deadline, size cap and paging: [#475](https://github.com/kubescape/storage/pull/475). Admission, kind queue and metrics: [#486](https://github.com/kubescape/storage/pull/486). Docs: [#487](https://github.com/kubescape/storage/pull/487), [#497](https://github.com/kubescape/storage/pull/497) | Merged |
+| 3 | [helm-charts#989](https://github.com/kubescape/helm-charts/pull/989) (values, reader ClusterRoles), [#1006](https://github.com/kubescape/helm-charts/pull/1006), [#1012](https://github.com/kubescape/helm-charts/pull/1012), [#1018](https://github.com/kubescape/helm-charts/pull/1018) (call timeout, response cap); admission values in [#1027](https://github.com/kubescape/helm-charts/pull/1027) | Merged; #1027 open |
+| 4 | Kagent example | Not started: Kagent v1.0.0's `RemoteMCPServer` TLS settings still have only `disableVerify`, so it cannot trust the cluster CA. The storage docs show Gemini CLI as the example client |
+| 5 | `kubescape mcpserver` on `pkg/mcp/tools` | Not started (optional) |
+
+**Where the code differs from the design:**
+
+- **`get` on `mcpservers/mcp` too.** `kubescape-mcp-reader` grants `create` and `get` (6.9 showed only `create`). Clients
+  built on the MCP TypeScript SDK, such as Gemini CLI, open an optional `GET` stream after they connect. Storage answers
+  it with 405, which they accept, but without `get` kube-apiserver answers 403 and the client disconnects before it lists
+  the tools ([helm-charts#1006](https://github.com/kubescape/helm-charts/pull/1006)).
+- **No partial results at the deadline.** A call that reaches `mcp.callTimeout` gets the `TIMEOUT` tool error; there is
+  no partial result with `truncated: true` (6.6 and section 9). `truncated` marks a paged list only.
+- **A result over the cap is an error, not cut.** A result above `mcp.maxResponseBytes` is replaced by a new tool error,
+  `RESPONSE_TOO_LARGE`, with its size and how to ask that tool for less (lower `limit`, page, filter).
+- **The kind queue is not a chart value.** Storage adds the `mcpservers` queue (10 long, 1 worker, 64 KiB) after it
+  loads its config, because a config file that sets `kindQueues`, like the operator chart's, replaces the default map as
+  a whole. The `storage.kindQueues.mcpservers` block in 6.9 is not needed.
+- **The authorizer moved to a shared package.** Following [`in-cluster-api-authn-authz.md`](in-cluster-api-authn-authz.md),
+  [storage#482](https://github.com/kubescape/storage/pull/482) moved the endpoint's SubjectAccessReview authorizer to
+  `storage/pkg/apiauth` (`apiauth.NewAuthorizer`), so storage and the other in-cluster APIs use one copy.
+- **Metrics.** Shipped on storage's `/metrics`: `storage_mcp_tool_calls_total{tool,result}`,
+  `storage_mcp_tool_call_duration_seconds{tool}`, `storage_mcp_tool_response_bytes{tool}`,
+  `storage_mcp_admission_running`, `storage_mcp_admission_waiting`, `storage_mcp_admission_wait_seconds` and
+  `storage_mcp_admission_rejected_total{reason}`. The SAR cache hit and miss counts from section 8 are not exported.
+- **Golden tests in storage only.** `pkg/mcp/tools/golden_test.go` pins the tool list and each tool's output; the shared
+  run from kubescape (6.8) comes with phase 5.
+
+**Open questions (section 13):**
+
+1. Cache duration: 10 seconds for allowed and denied answers, the defaults in `pkg/apiauth`, shared with the in-cluster
+   APIs.
+2. Default limits: kept at 1 running, 10 waiting for at most 30s, 20s and 256 KiB. In the load test on kind (storage#486:
+   `rateLimitPerClient` on, `rateLimitTotal` 10, 40 parallel agents calling for 30s next to 30 writes), writes went from
+   0 of 30 accepted without the admission limit to 30 of 30 with it. Refused calls get 429 with `Retry-After: 1`.
+3. Kagent CA: still open; Kagent v1.0.0 has no CA option for `RemoteMCPServer`.
+4. Resource name: kept as `mcpservers/mcp`.
+
+## 15. References
 
 - Slack discussion: #kubescape-dev, 2026-10-16 to 2026-10-22 (Ben Hirschberg, Matthias Bertschy, Mohit Yadav)
 - [`storage-grpc-fastpath-auth.md`](storage-grpc-fastpath-auth.md): authorization model for storage
