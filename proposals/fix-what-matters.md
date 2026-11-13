@@ -1,6 +1,6 @@
 # Proposal: Fix What Matters, runtime-proven risk ranking and a security agent for Kubescape
 
-- **Status:** Draft
+- **Status:** Proposed
 - **Author:** Sarthak Shreshtha ([@Sarthak-Shreshtha01](https://github.com/Sarthak-Shreshtha01))
 - **Date:** 2026-11-13
 - **Scope:** [`kubescape`](https://github.com/kubescape/kubescape) (ranking, MCP tools), [`storage`](https://github.com/kubescape/storage)
@@ -38,17 +38,21 @@ Everything is read-only, scoped by the caller's own RBAC, and off by default.
 
 ### The problem
 
-Measured on a kind cluster with the operator chart and two scanned images (nginx:1.27, redis:7.4), using the 9 read
-tools that `kubescape mcpserver` and the storage endpoint serve:
+Measured on a kind cluster running 25 workloads with 25 common images (section 7), with the 9 read tools that
+`kubescape mcpserver` and the storage endpoint serve:
 
 | Question an agent gets | Calls today | Data read | Grows with |
 |---|---|---|---|
-| "Top critical CVEs in the cluster" | 3 | 13.5 KB, 48 matches, 32 unique CVEs, severity only | 1 + images × pages |
-| "Which images ship openssl?" | 4 | 1.5 KB | 1 + SBOMs |
+| "Top critical CVEs in the cluster" | 26 | 545 KB (2,117 matches, 514 CVEs) | 1 + images × pages |
+| "Which workloads have CVE-2026-5450?" | 26 | 74 KB | 1 + workloads |
+| "Which resources fail C-0016?" | 129 | 283 KB | 1 + scanned resources |
+| "Which images ship openssl?" | 26 | 12 KB | 1 + SBOMs |
 | "What should I fix first?" | not possible | no runtime, exposure or permission signal is reachable by an in-cluster agent | |
 
-With a few hundred images the first question is hundreds of calls and megabytes of context, and the answer is still
-ordered by severity alone.
+With a few hundred images these are hundreds of calls and megabytes of context, and the answers are still ordered by
+severity alone. On the same cluster, **only 26% of the 16,180 Critical and High findings are in packages the
+containers actually load, and only 4.4% are loaded, reachable from outside the cluster and on a workload whose
+ServiceAccount has permissions worth taking.**
 
 The roadmap names this gap in item 5.1: *"The hard part is data shaping rather than protocol ... the exposed surface
 needs query and filter semantics, comparable to the filtering the UI already performs over the same data."*
@@ -158,6 +162,9 @@ The score is a sum of points, one table, returned with every item:
 | Fixable | yes 10, no 0 |
 
 - `unknown` sits in the middle, so missing data neither hides a finding nor promotes it.
+- `what_to_fix_first` ranks **workloads**, not single findings: a workload's score is its best finding's score, and it
+  lists the loaded, fixable findings behind it. Ranked one finding at a time, one exposed image with many CVEs fills
+  the whole top 20 (section 7), while the fix is usually one action per workload: upgrade the image.
 - Ties are broken by severity, then by CVE ID and workload name, so the order is stable.
 - The points are defaults in a config map. Users can change them; the answer always states which weights were used.
 - A golden scenario in CI pins the ranking: a fixed set of workloads (exposed + loaded + privileged, internal + not
@@ -172,7 +179,7 @@ New tools, all read-only, all with the query contract below.
 
 | Tool | Answers | Default size |
 |---|---|---|
-| `what_to_fix_first` | Ranked findings for a namespace or the cluster, with explanations | top 10 |
+| `what_to_fix_first` | Ranked workloads for a namespace or the cluster, each with its signals and its top loaded, fixable findings | top 10 |
 | `explain_workload_risk` | Every signal for one workload, with the objects behind it | one workload |
 | `top_vulnerabilities` | Cluster-wide CVEs by severity, fixability and relevancy | top 20 |
 | `find_workloads_by_cve` | Workloads with a CVE, and whether it is loaded there | 50 |
@@ -191,27 +198,31 @@ kubescape#4187): `filter` arguments per tool, `limit` with a documented maximum,
 {
   "scope": {"namespace": "shop"},
   "weights": "default",
-  "total": 1243, "returned": 2, "truncated": true,
+  "total": 14, "returned": 2, "truncated": true,
   "items": [
     {
       "rank": 1, "score": 120,
       "workload": {"namespace": "shop", "kind": "Deployment", "name": "checkout", "container": "app"},
-      "finding": {"type": "vulnerability", "id": "CVE-2026-0001", "package": "openssl", "version": "3.0.2", "severity": "Critical"},
       "signals": {
-        "relevant":     {"value": "yes", "from": "vulnerabilitymanifests/kubescape/deployment-checkout-app-..."},
         "exposure":     {"value": "external", "via": ["Ingress shop/shop -> Service shop/checkout:443"]},
-        "blast_radius": {"value": "namespace", "via": ["Role shop/app-secrets: get secrets"]},
-        "fixable":      {"value": "yes", "fixed_in": ["3.0.7"]}
-      }
+        "blast_radius": {"value": "namespace", "via": ["Role shop/app-secrets: get secrets"]}
+      },
+      "findings": {"critical_high": 372, "loaded": 41, "loaded_fixable": 33},
+      "top_findings": [
+        {"id": "CVE-2026-0001", "package": "openssl", "version": "3.0.2", "severity": "Critical",
+         "relevant": {"value": "yes", "from": "vulnerabilitymanifests/kubescape/deployment-checkout-app-..."},
+         "fixed_in": ["3.0.7"], "score": 120}
+      ]
     },
     {
       "rank": 2, "score": 85,
       "workload": {"namespace": "shop", "kind": "Deployment", "name": "worker", "container": "worker"},
-      "finding": {"type": "vulnerability", "id": "CVE-2026-0002", "package": "libxml2", "severity": "High"},
       "signals": {
-        "relevant": {"value": "yes"}, "exposure": {"value": "isolated"},
-        "blast_radius": {"value": "unknown", "reason": "no permission to read RBAC objects"}, "fixable": {"value": "yes"}
-      }
+        "exposure": {"value": "isolated", "via": ["NetworkPolicy shop/deny-ingress"]},
+        "blast_radius": {"value": "unknown", "reason": "no permission to read RBAC objects"}
+      },
+      "findings": {"critical_high": 58, "loaded": 6, "loaded_fixable": 6},
+      "top_findings": [{"id": "CVE-2026-0002", "package": "libxml2", "severity": "High", "relevant": {"value": "yes"}, "score": 85}]
     }
   ]
 }
@@ -291,19 +302,65 @@ JSON patch to review. Nothing is applied.
 
 ## 7. Evidence and measurements
 
-The numbers in section 2 come from a kind cluster (Kubernetes v1.37.0, operator chart 1.42.0, continuous scanning on).
-Before the first code PR, the same benchmark runs on 20 to 30 images:
+**Setup.** kind (Kubernetes v1.37.0), operator chart 1.42.0 with continuous scanning on, Kubescape storage with
+kubescape#4875. 25 Deployments with 25 common images, mostly 2023 releases (nginx, httpd, traefik, caddy, grafana, registry,
+tomcat, prometheus, redis, memcached, rabbitmq, postgres, mysql, mariadb, mongo, vault, python, node, alpine, ubuntu,
+debian, busybox), set up so the signals differ:
+
+- exposure: NodePort Services and Ingresses (external), ClusterIP Services with no NetworkPolicy (open), a deny-all
+  ingress NetworkPolicy (isolated), and no Service;
+- blast radius: ServiceAccounts that can read Secrets, create pods, or are cluster-admin, and the default one;
+- all profiles completed before the run.
+
+The numbers below are from 2026-11-13. The scripts that create the workloads and take the measurements become the
+benchmark of phase 6.
+
+**Cost today** is in section 2: 26 to 129 calls and up to 545 KB for one question, growing with the cluster.
+
+**What the signals change**, over all 42,548 vulnerability findings (one CVE in one package of one workload):
+
+| | Findings | Share of Critical + High |
+|---|---|---|
+| Critical + High | 16,180 | 100% |
+| ... in a package the container loads | 4,239 | 26% |
+| ... loaded, and reachable (not isolated) | 3,462 | 21% |
+| ... loaded, reachable from outside the cluster, and the ServiceAccount has permissions | 712 | 4.4% |
+
+**Ordered by severity, as today**, the first 20 findings come from 11 workloads; all 20 are loaded, but only 4 are on
+an externally reachable workload, 4 on a privileged one, and 2 are both.
+
+**Workloads ranked by the score vs by number of criticals** (selected rows):
+
+| Workload | Exposure | Blast radius | Critical + High | Loaded | Rank by criticals | Rank by score |
+|---|---|---|---|---|---|---|
+| grafana | external | cluster-admin | 255 | 183 | 8 | **1** |
+| nginx 1.25 | external | reads Secrets | 372 | 372 | 7 | **2** |
+| traefik | external | creates pods | 169 | 157 | 10 | **3** |
+| httpd | external | none | 3,850 | 154 (4%) | 1 | 6 |
+| redis 7.0 | open | none | 3,949 | 170 (4%) | 2 | 13 |
+| memcached | open | none | 3,699 | 88 (2%) | 3 | 15 |
+| postgres 16 | isolated | none | 442 | 348 | 6 | 21 |
+| mongo | isolated | none | 203 | 170 | 13 | 22 |
+
+The three images with the most critical CVEs load 2 to 4% of them; the workloads an attacker could actually use first
+(exposed and privileged) were ranked 7th to 10th by count. Isolated databases with many loaded CVEs drop to the end:
+they still need patching, but not first.
+
+**Limits found by the run.**
+- For nginx, tomcat and rabbitmq the filtered report equals the full one: relevancy did not narrow those images. The
+  ranking still works (the other signals apply), and `relevant` is reported as `yes` for them. Why relevancy keeps
+  every package for these images is a node-agent question to follow up.
+- Ranked one finding at a time, grafana alone fills the top 20; hence ranking by workload (section 6.3).
+
+**Targets.**
 
 | Measure | Today | Target |
 |---|---|---|
-| Calls for "what should I fix first in this cluster" | not possible ("top CVEs" alone is 1 + images × pages) | 1 |
+| Calls for "what should I fix first in this cluster" | not possible ("top CVEs" alone: 26 calls, 545 KB) | 1 |
 | Bytes an agent reads for it | grows with the cluster | a few KB, fixed budget |
 | Top findings shown with runtime, exposure and permission evidence | none | all |
 | Benchmark questions answerable on a default install | configuration questions return nothing | all |
 | Install to first ranked answer | build your own agent, prompt and RBAC | one Helm value, about 5 minutes |
-
-The same run reports how many of the top 20 findings by severity are actually loaded and reachable, which is the
-number that shows the value of the ranking.
 
 ## 8. Security considerations
 
@@ -317,7 +374,7 @@ number that shows the value of the ranking.
 
 | Phase | What | Repos |
 |---|---|---|
-| 1. Foundations | One copy of the read tools (storage-mcp-endpoint.md phase 5); tools for the summaries a default install stores; `relevant_only` filters; generated network policies and seccomp profiles readable | kubescape, storage, helm-charts |
+| 1. Foundations | One copy of the read tools (storage-mcp-endpoint.md phase 5, kubescape#4875); tools for the summaries a default install stores; `relevant_only` filters; generated network policies and seccomp profiles readable | kubescape, storage, helm-charts |
 | 2. Query tools | Query contract; index; `top_vulnerabilities`, `find_workloads_by_cve`, `find_workloads_by_package`, `failing_resources_by_control`, `workload_overview` | storage |
 | 3. Ranking | Signals package, score, golden scenario; `what_to_fix_first` and `explain_workload_risk` in `kubescape mcpserver` (option A) | kubescape |
 | 4. Security Agent | Kubescape skill, agent template, chart values, briefing schema, agent evaluation; Kagent CA support upstream | helm-charts, kagent |
