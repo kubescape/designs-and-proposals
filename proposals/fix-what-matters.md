@@ -4,334 +4,436 @@
 - **Author:** Sarthak Shreshtha ([@Sarthak-Shreshtha01](https://github.com/Sarthak-Shreshtha01))
 - **Date:** 2026-11-13
 - **Scope:** [`kubescape`](https://github.com/kubescape/kubescape) (ranking, MCP tools), [`storage`](https://github.com/kubescape/storage)
-  (query layer and index, MCP endpoint tools), [`helm-charts`](https://github.com/kubescape/helm-charts) (values, roles,
-  Kagent agent), [`kubescape.io`](https://github.com/kubescape/kubescape.io) (guides)
+  (query tools and index), [`helm-charts`](https://github.com/kubescape/helm-charts) (values, roles, Kagent agent),
+  [`kubescape.io`](https://github.com/kubescape/kubescape.io) (guides)
 - **Roadmap:** item 5.1, Kagent and MCP support; item 1.1, API hardening (the MCP surface)
 - **Builds on:** [`storage-mcp-endpoint.md`](storage-mcp-endpoint.md) (the in-cluster MCP endpoint)
-- **Related:** [`attack-path-analysis.md`](attack-path-analysis.md) (attack paths, a separate engine this proposal does
-  not duplicate), [kubescape#4200](https://github.com/kubescape/kubescape/issues/4200) (summary-first scan tools),
+- **Related:** [`attack-path-analysis.md`](attack-path-analysis.md) (attack paths: a separate engine, not duplicated
+  here), [kubescape#4200](https://github.com/kubescape/kubescape/issues/4200) (summary-first scan tools),
   [kagent#3662](https://github.com/kagent-dev/kagent/issues/3662) (custom CA for `RemoteMCPServer`)
 
 ## 1. Summary
 
-A cluster has thousands of vulnerabilities and posture findings, sorted only by severity. Most of them can never be
-exploited: the vulnerable package is never loaded, the workload cannot be reached, or it has no permissions worth
-taking. Kubescape already knows which ones are which, but the signals live in different places and no agent can join
-them.
+A cluster has thousands of vulnerabilities, sorted only by severity. Most of them can never be used by an attacker:
+the vulnerable code is never loaded, nobody can reach the workload, or the workload has no permissions worth taking.
+Kubescape already knows which is which. It just never puts the pieces together.
 
-This proposal adds one question Kubescape can answer, for people and for AI agents: **"What should I fix first, and
-why?"** The answer is a short ranked list. Every item carries the evidence behind its rank: loaded at runtime,
-reachable from where, what its ServiceAccount can do, and whether a fix exists.
+This proposal lets Kubescape answer one question, for people and for AI agents:
+
+> **"What should I fix first, and why?"**
+
+The answer is a short ranked list of workloads. Each one says **why** it is on the list: the vulnerable code is loaded,
+someone outside can reach it, its ServiceAccount can do damage, and a fix exists.
 
 It has three parts:
 
-1. **A ranking** that joins four signals Kubescape already collects (runtime relevancy, exposure, blast radius,
-   fixability) into one explainable score.
-2. **Query tools** on the MCP surface that answer cluster-wide questions in one call ("top fixable critical CVEs loaded
-   at runtime", "which workloads have CVE-X"), instead of an agent fetching every report.
-3. **The Kubescape Security Agent**: a ready-made Kagent agent with a Kubescape skill, read-only access through the
-   storage endpoint, and a structured daily briefing, behind one Helm value.
+1. **A ranking** that joins four checks Kubescape already does into one simple score.
+2. **Query tools** that answer cluster-wide questions in one call, instead of an agent opening every report.
+3. **The Kubescape Security Agent**: a ready-made Kagent agent that uses these tools, behind one Helm value.
 
-Everything is read-only, scoped by the caller's own RBAC, and off by default.
+Everything is read-only, limited by the caller's own RBAC, and off by default.
 
-## 2. Motivation
+### Before and after, in one picture
 
-### The problem
+```mermaid
+flowchart LR
+  subgraph Before["Today"]
+    direction TB
+    B1["Agent: what should I fix first?"] --> B2["List every vulnerability report"]
+    B2 --> B3["Open each report, page by page<br/>(26 calls, 545 KB on 25 images)"]
+    B3 --> B4["Sort by severity"]
+    B4 --> B5["Top of the list: httpd, redis, memcached<br/>96 to 98% of their CVEs are never loaded"]
+  end
+  subgraph After["With Fix What Matters"]
+    direction TB
+    A1["Agent: what should I fix first?"] --> A2["what_to_fix_first (1 call, a few KB)"]
+    A2 --> A3["1. grafana: loaded, internet-facing, cluster-admin<br/>2. nginx: loaded, internet-facing, reads Secrets<br/>3. traefik: loaded, internet-facing, creates pods"]
+  end
+```
 
-Measured on a kind cluster running 25 workloads with 25 common images (section 7), with the 9 read tools that
-`kubescape mcpserver` and the storage endpoint serve:
+## 2. The problem
 
-| Question an agent gets | Calls today | Data read | Grows with |
-|---|---|---|---|
-| "Top critical CVEs in the cluster" | 26 | 545 KB (2,117 matches, 514 CVEs) | 1 + images × pages |
-| "Which workloads have CVE-2026-5450?" | 26 | 74 KB | 1 + workloads |
-| "Which resources fail C-0016?" | 129 | 283 KB | 1 + scanned resources |
-| "Which images ship openssl?" | 26 | 12 KB | 1 + SBOMs |
-| "What should I fix first?" | not possible | no runtime, exposure or permission signal is reachable by an in-cluster agent | |
+### People and agents drown in findings
 
-With a few hundred images these are hundreds of calls and megabytes of context, and the answers are still ordered by
-severity alone. On the same cluster, **only 26% of the 16,180 Critical and High findings are in packages the
-containers actually load, and only 4.4% are loaded, reachable from outside the cluster and on a workload whose
-ServiceAccount has permissions worth taking.**
+We set up a kind cluster with 25 workloads running 25 common images (section 8) and asked the questions a security
+engineer asks, using the 9 read tools that `kubescape mcpserver` and the storage endpoint serve today:
+
+| Question | Calls today | Data the agent reads |
+|---|---|---|
+| "Top critical CVEs in the cluster" | 26 | 545 KB |
+| "Which workloads have CVE-2026-5450?" | 26 | 74 KB |
+| "Which resources fail control C-0016?" | 129 | 283 KB |
+| "Which images ship openssl?" | 26 | 12 KB |
+| "What should I fix first?" | **not possible** | no tool gives runtime, reachability or permission data |
+
+Every number grows with the cluster. With a few hundred images, one question is hundreds of calls and megabytes of
+text: more than an agent can read, and the answer is still sorted by severity alone.
+
+### Most of those findings do not matter
+
+On the same cluster, out of 16,180 Critical and High findings:
+
+```mermaid
+flowchart LR
+  A["16,180<br/>Critical + High"] -->|"is the vulnerable code loaded?"| B["4,239 (26%)<br/>loaded at runtime"]
+  B -->|"can anyone reach it?"| C["3,462 (21%)<br/>loaded + reachable"]
+  C -->|"from outside, and can it do damage?"| D["712 (4.4%)<br/>loaded + internet-facing<br/>+ privileged"]
+```
+
+**Only 4.4% are worth fixing first.** Today Kubescape shows all 16,180, ordered by severity.
 
 The roadmap names this gap in item 5.1: *"The hard part is data shaping rather than protocol ... the exposed surface
 needs query and filter semantics, comparable to the filtering the UI already performs over the same data."*
 
-### Why Kubescape can do this and image scanners cannot
+### Why Kubescape, and not an image scanner
 
-Runtime relevancy is Kubescape's differentiator: node-agent records which packages a container actually loads, and
-storage keeps the vulnerabilities filtered to them. An image-only scanner cannot tell a loaded critical CVE from an
-unused one. Joining relevancy with reachability and permissions puts that differentiator at the centre of every answer.
+Runtime relevancy is what sets Kubescape apart: node-agent records which packages a container actually loads. An image
+scanner only sees the image, so it cannot tell a loaded critical CVE from an unused one. This proposal puts relevancy at
+the centre of every answer.
 
-## 3. Words used in this proposal
+## 3. Before and after: one conversation
 
-| Word | Meaning here |
-|---|---|
-| **Finding** | One vulnerability in one package of one workload's container, or one failed control on one resource. |
-| **Relevant** | The vulnerable package was loaded by the container at runtime (node-agent's relevancy data). |
-| **Exposure** | Who can reach the workload: from outside the cluster (Service, Ingress, Gateway), from any pod, from some pods, or none. |
-| **Blast radius** | What the workload's ServiceAccount can do if the workload is taken over. |
-| **Signal** | One of relevancy, exposure, blast radius, fixability, each with the value `yes`, `no` or `unknown`. |
-| **Explanation** | The list of signals behind a rank, each with the Kubescape object it came from. |
+The agent's words below are illustrative; the calls, sizes and numbers are from our kind cluster.
 
-## 4. Current state (checked against kubescape master `8ab01ea5` and storage main `b15ceb6d`)
+**Today**, an agent connected to Kubescape's tools:
 
-| Signal | Where it is computed today | Reachable by in-cluster agents? |
+> **User:** What should I fix first?
+>
+> **Agent:** *(calls `list_vulnerability_manifests`, then `list_vulnerabilities_in_manifest` 25 times, reads 545 KB)*
+> The images with the most critical CVEs are httpd (3,850 Critical/High), redis 7.0 (3,949) and memcached (3,699).
+> I suggest upgrading those first.
+
+That advice is wrong. Those three images load only 2 to 4% of their vulnerable packages, and none of them has
+permissions. Meanwhile grafana, which is reachable from outside the cluster and runs as cluster-admin, is 8th.
+
+**With Fix What Matters:**
+
+> **User:** What should I fix first?
+>
+> **Agent:** *(calls `what_to_fix_first` once, reads a few KB)*
+> 1. **grafana**: 183 vulnerable packages are loaded at runtime (159 have a fix), it is reachable from outside through
+>    a NodePort Service, and its ServiceAccount is cluster-admin. Upgrade the image first.
+> 2. **nginx 1.25**: loaded, reachable from outside, its ServiceAccount can read Secrets in `bench`.
+> 3. **traefik**: loaded, reachable from outside, its ServiceAccount can create pods.
+>
+> httpd, redis and memcached have many CVEs, but almost none of them are loaded and they have no permissions: patch
+> them later.
+>
+> **User:** Why is grafana first?
+>
+> **Agent:** *(calls `explain_workload_risk`)* Each reason, with the Kubescape object it came from: the loaded-package
+> report, the Service `bench/grafana`, the ClusterRoleBinding `bench-sa-admin`.
+
+| | Today | After |
 |---|---|---|
-| Runtime relevancy | node-agent; storage keeps workload-level `VulnerabilityManifest`s with `kubescape.io/context=filtered` and `SBOMSyftFiltered` | Partly: the manifests are listable through the endpoint, but no tool uses the filtered context as a signal |
-| Exposure (in-cluster) | `core/pkg/networkpolicy` (NetworkPolicy index, `Exposure` levels) | No: CLI only (`analyze_vulnerability_exposure`) |
-| Exposure (external) | `core/pkg/exposure` (LoadBalancer, NodePort, externalIPs, Ingress, HTTPRoute, GRPCRoute) | No: CLI only |
-| Joining exposure and CVEs | `core/pkg/vulnexposure.Correlate`: sorts findings by external exposure, then NetworkPolicy exposure, then severity | No: CLI only |
-| Blast radius | `core/pkg/rbacgraph` (escalation paths, cluster-admin reachable or not), `core/pkg/attackpath` (workload → ServiceAccount identity) | No: CLI only (`analyze_rbac_escalation_paths`) |
-| Fixability | every `VulnerabilityManifest` (`vulnexposure.FixAvailable`) | Yes, per manifest |
-| Hardening from runtime | `get_configuration_drift` (ContainerProfile vs manifest) | No: CLI only |
-| Summaries on a default install | `VulnerabilitySummary`, `VulnerabilityManifestSummary`, `WorkloadConfigurationScanSummary` | No tool reads the vulnerability summaries; with `continuousScan: disable` (chart default) the full configuration scans behind `get_configuration_security_scan_manifest` are not stored |
+| Calls | 26 | 1 |
+| Data read by the agent | 545 KB | a few KB |
+| Ordered by | severity only | loaded, reachable, permissions, fix, severity |
+| Says why | no | yes, with the objects behind each reason |
+| Top 3 | httpd, redis, memcached (2 to 4% loaded, no permissions) | grafana, nginx, traefik (loaded, internet-facing, privileged) |
 
-So the parts exist. What is missing is the join with relevancy and blast radius, a score that explains itself, and a
-way for an agent in the cluster to ask for it.
+## 4. Words used in this proposal
 
-## 5. Goals and non-goals
+| Word | Meaning |
+|---|---|
+| **Finding** | One vulnerability in one package of one workload. |
+| **Loaded** (relevant) | The vulnerable package was loaded by the container when it ran (node-agent's relevancy data). |
+| **Exposure** | Who can reach the workload: `external` (from outside the cluster), `open` (any pod), `isolated` (a NetworkPolicy blocks it). |
+| **Blast radius** | What the workload's ServiceAccount can do if an attacker takes the workload over. |
+| **Signal** | One of the four checks: loaded, exposure, blast radius, fixable. |
 
-### Goals
+## 5. What exists today
 
-- One call answers "what should I fix first" for a namespace or the cluster, with a fixed size budget (a few KB).
-- Every ranked item explains itself; nothing is a black box.
-- A signal the caller may not read is `unknown`, never guessed and never leaked (section 6.7).
-- The score is simple, documented, configurable, and pinned by a test scenario in CI.
-- Cluster-wide query tools replace "list everything, then fetch each one".
-- A working security agent from one Helm value, on Kagent 1.0 features only.
-- Before/after numbers from a benchmark of real questions, kept in CI as size budgets.
+The pieces exist. Nobody joins them, and in-cluster agents cannot reach most of them.
 
-### Non-goals
+| Check | Where Kubescape has it today | Can an in-cluster agent use it? |
+|---|---|---|
+| Loaded at runtime | node-agent; storage keeps a "filtered" vulnerability report per workload (`kubescape.io/context=filtered`) | Partly: the report can be read, but no tool uses it as a signal |
+| Exposure | `core/pkg/exposure` (Services, Ingress, Gateway routes) and `core/pkg/networkpolicy` | No, CLI only (`analyze_vulnerability_exposure`) |
+| Exposure joined with CVEs | `core/pkg/vulnexposure.Correlate` | No, CLI only |
+| Blast radius | `core/pkg/rbacgraph` (escalation paths), `core/pkg/attackpath` (workload → ServiceAccount) | No, CLI only (`analyze_rbac_escalation_paths`) |
+| Fix available | every vulnerability report | Yes, one report at a time |
+| Hardening from runtime | `get_configuration_drift` | No, CLI only |
 
-- An attack-path engine. [`attack-path-analysis.md`](attack-path-analysis.md) owns multi-hop paths; this proposal uses
-  the existing `rbacgraph` result per ServiceAccount and can add attack-path results later if that engine lands.
+(Checked against kubescape master `8ab01ea5` and storage main `b15ceb6d`.)
+
+## 6. Goals and non-goals
+
+**Goals**
+- One call answers "what should I fix first" for a namespace or the whole cluster, in a few KB.
+- Every item says why it is ranked there. No black box.
+- If the caller may not read something, that signal is `unknown`. It is never guessed and never leaked.
+- The score is simple, written down, configurable, and checked in CI.
+- Cluster-wide questions take one call instead of "list everything, then open each one".
+- A working security agent from one Helm value.
+
+**Non-goals**
+- An attack-path engine. [`attack-path-analysis.md`](attack-path-analysis.md) owns multi-step paths.
 - Summary-first output for the scan tools ([kubescape#4200](https://github.com/kubescape/kubescape/issues/4200)).
-- VEX ingestion, runtime event history or forensics.
-- Anything that changes the cluster. Hardening is returned as a patch for a human to review.
+- VEX, runtime event history, forensics.
+- Anything that changes the cluster. Fixes are suggestions for a human to apply.
 
-## 6. Proposed design
+## 7. Design
 
-### 6.1 Big picture
+### 7.1 Big picture
 
 ```mermaid
 flowchart TB
-  subgraph Clients
-    KA["Kagent: Kubescape Security Agent<br/>(AgentTemplate + Kubescape skill)"]
-    OC["Other MCP clients<br/>(Gemini CLI, kubescape mcpserver on a laptop)"]
+  KA["Kubescape Security Agent (Kagent)"] --> API
+  OC["Any MCP client<br/>(Gemini CLI, Claude, kubescape mcpserver)"] --> API
+  API["kube-apiserver<br/>who is calling? may they use the endpoint?"] --> EP
+  subgraph STR["Kubescape storage: MCP endpoint (already built)"]
+    EP["checks every read against the caller's RBAC,<br/>limits size and time"]
+    EP --> RT["9 read tools (today)"]
+    EP --> QT["new query tools (7.4)"]
+    QT --> IDX[("small index (7.5)")]
   end
-  KA -->|ServiceAccount token| API
-  OC --> API
-  API["kube-apiserver<br/>authn, RBAC on mcpservers/mcp, APF"] --> EP
-  subgraph STR["storage MCP endpoint (storage-mcp-endpoint.md)"]
-    EP["per-read access check, admission limit,<br/>deadline, size cap, audit, metrics"]
-    RT["read tools (9 today)"]
-    QT["query tools (6.4)"]
-    IDX[("index (6.5), off by default")]
-    EP --> RT
-    EP --> QT --> IDX
-  end
-  subgraph RANK["ranking (6.6)"]
-    R["relevancy + exposure + blast radius + fixability<br/>→ score → ranked, explained answer"]
-  end
-  EP --> R
+  EP --> R["ranking (7.3):<br/>loaded + exposure + blast radius + fix → score"]
 ```
 
-### 6.2 The four signals
+### 7.2 The four signals
 
-Each signal is computed per (workload, container) and has the value `yes`, `no` or `unknown`, plus the objects it came
-from.
+For every workload, Kubescape answers four questions:
 
-| Signal | `yes` when | `unknown` when | Source |
+```mermaid
+flowchart LR
+  W["A workload with a<br/>critical CVE"] --> Q1{"Is the vulnerable<br/>package loaded?"}
+  W --> Q2{"Who can<br/>reach it?"}
+  W --> Q3{"What can its<br/>ServiceAccount do?"}
+  W --> Q4{"Is there<br/>a fix?"}
+  Q1 --> S["score + reasons"]
+  Q2 --> S
+  Q3 --> S
+  Q4 --> S
+```
+
+| Signal | Possible values | Example from our cluster | Where the answer comes from |
 |---|---|---|---|
-| **relevant** | the CVE is in the workload's filtered manifest (`kubescape.io/context=filtered`) | relevancy is disabled, the profile is not complete yet, or the caller may not read the manifest | storage |
-| **exposure** | `external` (a Service, Ingress or Gateway route reaches it), else `open` / `restricted` / `isolated` from the NetworkPolicy index | the caller may not read Services, Ingresses, routes or NetworkPolicies in the namespace | `core/pkg/exposure`, `core/pkg/networkpolicy` |
-| **blast radius** | `cluster` (the ServiceAccount reaches cluster-admin), `namespace` (it can read Secrets, or create pods or workloads, in a namespace), else `none` | the caller may not read the RBAC objects involved | `core/pkg/rbacgraph`, `core/pkg/attackpath` |
-| **fixable** | grype reports a fixed version (`vulnexposure.FixAvailable`) | never: it is in every manifest | storage |
+| **Loaded** | yes, no, unknown | grafana: 183 of 255 Critical/High packages loaded; httpd: 154 of 3,850 | the filtered vulnerability report |
+| **Exposure** | external, open, isolated, unknown | grafana: NodePort Service → external; postgres 16: deny-all NetworkPolicy → isolated | Services, Ingress, routes, NetworkPolicies |
+| **Blast radius** | cluster, namespace, none, unknown | grafana: cluster-admin → cluster; nginx: can read Secrets → namespace | RoleBindings, ClusterRoleBindings |
+| **Fixable** | yes, no | grafana: 159 of the 183 loaded have a fixed version | the vulnerability report |
 
-### 6.3 The score
+A signal is `unknown` when the data is not there yet (for example, the container is still being profiled) or when the
+caller is not allowed to read it.
 
-The score is a sum of points, one table, returned with every item:
+### 7.3 The score
 
-| Factor | Points |
+Points for each signal, added up. One small table:
+
+| Signal | Points |
 |---|---|
-| Severity | Critical 40, High 30, Medium 15, Low 5, other 0 |
-| Relevant | yes 30, unknown 15, no 0 |
-| Exposure | external 25, open 15, restricted 5, isolated 0, unknown 10 |
+| Severity | Critical 40, High 30, Medium 15, Low 5 |
+| Loaded | yes 30, unknown 15, no 0 |
+| Exposure | external 25, open 15, isolated 0, unknown 10 |
 | Blast radius | cluster 25, namespace 15, none 0, unknown 8 |
 | Fixable | yes 10, no 0 |
 
-- `unknown` sits in the middle, so missing data neither hides a finding nor promotes it.
-- `what_to_fix_first` ranks **workloads**, not single findings: a workload's score is its best finding's score, and it
-  lists the loaded, fixable findings behind it. Ranked one finding at a time, one exposed image with many CVEs fills
-  the whole top 20 (section 7), while the fix is usually one action per workload: upgrade the image.
-- Ties are broken by severity, then by CVE ID and workload name, so the order is stable.
-- The points are defaults in a config map. Users can change them; the answer always states which weights were used.
-- A golden scenario in CI pins the ranking: a fixed set of workloads (exposed + loaded + privileged, internal + not
-  loaded + harmless, and the mixes in between) whose expected order is checked on every change.
+**Worked example**, two real findings from our cluster:
 
-A weighted sum was chosen over a strict tier order (relevant first, then exposure, ...) because a tier order lets one
-`unknown` decide everything, and because a sum is easy to show next to each item.
-
-### 6.4 The tools
-
-New tools, all read-only, all with the query contract below.
-
-| Tool | Answers | Default size |
+| | grafana: CVE-2024-45337 in golang.org/x/crypto | httpd: CVE-2026-111497 in libbrotli1 |
 |---|---|---|
-| `what_to_fix_first` | Ranked workloads for a namespace or the cluster, each with its signals and its top loaded, fixable findings | top 10 |
-| `explain_workload_risk` | Every signal for one workload, with the objects behind it | one workload |
-| `top_vulnerabilities` | Cluster-wide CVEs by severity, fixability and relevancy | top 20 |
-| `find_workloads_by_cve` | Workloads with a CVE, and whether it is loaded there | 50 |
-| `find_workloads_by_package` | Workloads whose image ships a package (name, optional version range) | 50 |
-| `failing_resources_by_control` | Resources failing a control, from the summaries a default install stores | 50 |
-| `workload_overview` | Vulnerabilities, configuration result, profile and generated policies of one workload | one workload |
-| `changes_since` | New loaded critical CVEs and newly failing controls since a cursor | 50 |
+| Severity | Critical: 40 | Critical: 40 |
+| Loaded | yes: 30 | no: 0 |
+| Exposure | external (NodePort): 25 | external (NodePort): 25 |
+| Blast radius | cluster-admin: 25 | none: 0 |
+| Fixable | yes: 10 | yes: 10 |
+| **Score** | **130** | **75** |
 
-**Query contract** (the same for every new tool, and the shape the existing tools already return since
-kubescape#4187): `filter` arguments per tool, `limit` with a documented maximum, `offset` or `continue`, and always
-`total`, `returned` and `truncated` in the answer. Long text fields only on request (`include_details`).
+Both are Critical and both have a fix. grafana's package is loaded and grafana is cluster-admin; httpd never loads
+libbrotli1 and has no permissions. Same severity, very different risk, and the score shows exactly why.
 
-**Example answer** of `what_to_fix_first` (shape only):
+Rules:
+- `unknown` gets middle points, so missing data neither hides a finding nor pushes it up.
+- **Workloads are ranked, not single CVEs.** A workload's score is its best finding's score. Ranked one CVE at a time,
+  grafana alone filled the whole top 20 in our run, but the fix is one action: upgrade grafana's image.
+- Ties are broken by severity, then by name, so the order never jumps around.
+- The points are defaults that users can change. The answer always says which points were used.
+- A fixed test cluster in CI (exposed + loaded + privileged, isolated + unused + harmless, and the mixes in between)
+  checks the order on every change.
+
+### 7.4 The tools
+
+| Tool | Question it answers | Default size |
+|---|---|---|
+| `what_to_fix_first` | What should I fix first in this namespace or cluster? | top 10 workloads |
+| `explain_workload_risk` | Why is this workload ranked here? | one workload |
+| `top_vulnerabilities` | What are the worst CVEs in the cluster (loaded, fixable, by severity)? | top 20 |
+| `find_workloads_by_cve` | Which workloads have CVE-X, and is it loaded there? | 50 |
+| `find_workloads_by_package` | Which workloads ship package Y? | 50 |
+| `failing_resources_by_control` | Which resources fail control C-Z? (works on a default install) | 50 |
+| `workload_overview` | Everything about one workload in one call | one workload |
+| `changes_since` | What new loaded critical CVEs or failing controls appeared since yesterday? | 50 |
+
+All tools are read-only and follow the same rules as the existing ones: a `limit`, paging, and always `total`,
+`returned` and `truncated` in the answer.
+
+**How one question flows:**
+
+```mermaid
+sequenceDiagram
+  participant A as Agent
+  participant K as kube-apiserver
+  participant S as Storage MCP endpoint
+  A->>K: what_to_fix_first {namespace: bench}
+  K->>K: who is calling? may they use the endpoint in bench?
+  K->>S: forward the call
+  S->>S: read reports, Services, bindings (each read checked against the caller's RBAC)
+  S->>S: score, rank by workload, keep top 10
+  S-->>A: ranked workloads with reasons (a few KB)
+```
+
+**Example answer** (shortened; numbers from our kind cluster):
 
 ```json
 {
-  "scope": {"namespace": "shop"},
+  "scope": {"namespace": "bench"},
   "weights": "default",
-  "total": 14, "returned": 2, "truncated": true,
+  "total": 23, "returned": 2, "truncated": true,
   "items": [
     {
-      "rank": 1, "score": 120,
-      "workload": {"namespace": "shop", "kind": "Deployment", "name": "checkout", "container": "app"},
-      "signals": {
-        "exposure":     {"value": "external", "via": ["Ingress shop/shop -> Service shop/checkout:443"]},
-        "blast_radius": {"value": "namespace", "via": ["Role shop/app-secrets: get secrets"]}
+      "rank": 1, "score": 130,
+      "workload": {"namespace": "bench", "kind": "Deployment", "name": "grafana"},
+      "reasons": {
+        "exposure":     {"value": "external", "via": ["Service bench/grafana (NodePort)"]},
+        "blast_radius": {"value": "cluster", "via": ["ClusterRoleBinding bench-sa-admin → cluster-admin"]}
       },
-      "findings": {"critical_high": 372, "loaded": 41, "loaded_fixable": 33},
+      "findings": {"critical_high": 255, "loaded": 183, "loaded_fixable": 159},
       "top_findings": [
-        {"id": "CVE-2026-0001", "package": "openssl", "version": "3.0.2", "severity": "Critical",
-         "relevant": {"value": "yes", "from": "vulnerabilitymanifests/kubescape/deployment-checkout-app-..."},
-         "fixed_in": ["3.0.7"], "score": 120}
+        {"id": "CVE-2024-45337", "package": "golang.org/x/crypto", "severity": "Critical", "loaded": "yes", "fixable": "yes", "score": 130}
       ]
     },
     {
-      "rank": 2, "score": 85,
-      "workload": {"namespace": "shop", "kind": "Deployment", "name": "worker", "container": "worker"},
-      "signals": {
-        "exposure": {"value": "isolated", "via": ["NetworkPolicy shop/deny-ingress"]},
-        "blast_radius": {"value": "unknown", "reason": "no permission to read RBAC objects"}
+      "rank": 2, "score": 120,
+      "workload": {"namespace": "bench", "kind": "Deployment", "name": "nginx125"},
+      "reasons": {
+        "exposure":     {"value": "external", "via": ["Service bench/nginx125 (NodePort)"]},
+        "blast_radius": {"value": "namespace", "via": ["RoleBinding bench/sa-secrets → get, list secrets"]}
       },
-      "findings": {"critical_high": 58, "loaded": 6, "loaded_fixable": 6},
-      "top_findings": [{"id": "CVE-2026-0002", "package": "libxml2", "severity": "High", "relevant": {"value": "yes"}, "score": 85}]
+      "findings": {"critical_high": 372, "loaded": 372, "loaded_fixable": 204}
     }
   ]
 }
 ```
 
-### 6.5 The index
+### 7.5 The index
 
-Cluster-wide questions cannot decode every report on every call. Storage keeps a small index next to its SQLite
-metadata, filled when a `VulnerabilityManifest`, `SBOMSyft` or `WorkloadConfigurationScanSummary` is saved:
+To answer cluster-wide questions in one call, storage keeps a small table of "which workload has which CVE in which
+package, how severe, fixable, loaded". It is filled **after** a report is saved, from a queue, so saving reports never
+gets slower.
 
-- rows: (namespace, object name, workload, container, CVE, package, version, severity, fix state, relevant) and
-  (namespace, resource, control, status, severity);
-- filled after the write is stored, from a bounded queue, so writes are never slowed down; rebuilt at start-up;
-- off by default (`storage.mcp.index.enabled`), with metrics (queue length, rows, rebuild time);
-- the PR that adds it carries a write-path load test, as the admission limit did.
+```mermaid
+flowchart LR
+  NA["node-agent / kubevuln<br/>save a report"] --> ST[("storage<br/>(as today)")]
+  ST -. "after the save, from a queue" .-> IX[("index<br/>CVE, package, workload, loaded")]
+  Q["query tools"] --> IX
+```
 
-Reads through the index keep the endpoint's per-namespace access check: rows are filtered by the namespaces the caller
-may read before anything is returned.
+- Off by default (`storage.mcp.index.enabled`), rebuilt at start-up, with metrics.
+- The PR that adds it includes a load test showing writes are not slowed down.
+- Answers are still filtered by what the caller may read.
 
-### 6.6 Where the ranking runs
+### 7.6 Where the ranking runs
 
-The ranking needs Services, Ingresses, Gateway routes, NetworkPolicies and RBAC objects, which storage does not hold,
-and the code that analyses them lives in `kubescape/core/pkg`. kubescape imports storage, so storage cannot import that
-code back.
+The ranking needs Services, Ingresses, NetworkPolicies and RBAC objects, which storage does not hold, and the code that
+reads them lives in `kubescape/core/pkg`. kubescape imports storage, so storage cannot import that code back.
 
-| Option | How | For | Against |
-|---|---|---|---|
-| **A. In the CLI first** | `what_to_fix_first` and `explain_workload_risk` in `kubescape mcpserver`, built on `vulnexposure.Correlate`, `rbacgraph` and the filtered manifests | No new permissions anywhere; reuses the analysis code as it is; ships first | Laptop only |
-| **B. In the in-cluster kubescape deployment** | The same code served by the kubescape deployment, which already reads the cluster for scans, behind kube-apiserver like the storage endpoint | No new permissions for storage; one copy of the code | A second endpoint for agents, with its own access checks |
-| **C. In storage** | Move `exposure`, `networkpolicy` and `rbacgraph` into a module both repos import; storage reads the objects with a read-only role | One endpoint for agents | Larger move; storage gains cluster read permissions, which the roadmap 1.1 review must accept |
+```mermaid
+flowchart TB
+  subgraph A["Option A: in the CLI (first)"]
+    A1["kubescape mcpserver on a laptop<br/>uses core/pkg as it is"]
+  end
+  subgraph B["Option B: in the kubescape deployment"]
+    B1["already reads the cluster for scans<br/>second endpoint for agents"]
+  end
+  subgraph C["Option C: in storage"]
+    C1["move the analysis code into a shared module<br/>storage gets read access to the cluster"]
+  end
+  A --> D{"decide B or C<br/>with real numbers"}
+  D --> B
+  D --> C
+```
 
-**Proposed:** A first, so the ranking and its golden scenario are proven on real clusters without new permissions.
-Then B or C, decided with the maintainers using the benchmark numbers. Either way the ranking code is one package with
-the signals as inputs, so where it runs does not change it.
-
-### 6.7 Access control
-
-- The caller reaches the tools exactly as today: `create` on `mcpservers/mcp` in a namespace, then a per-read access
-  check for every object a tool reads (storage-mcp-endpoint.md, section 6.5).
-- A signal is computed only from objects the caller may read. If the caller may not read RBAC objects in `shop`,
-  `blast_radius` is `unknown` with the reason. The explanation never names an object the caller could not have read.
-- The chart's optional reader roles grow by one role for the signal inputs (Services, Ingresses, routes,
-  NetworkPolicies, Roles and bindings: `get` and `list` only), bound separately so operators choose.
-
-### 6.8 The Kubescape Security Agent
-
-Built only from Kagent 1.0 features (`kagent.dev/v1alpha3`):
-
-| Part | Kagent feature | What ships |
+| Option | Good | Not so good |
 |---|---|---|
-| The agent | `AgentTemplate` and `Agent` | A security agent bound only to the endpoint's read tools |
-| Its know-how | Agent skills | The **Kubescape skill**: playbooks for fix-first triage, explaining one workload, hardening from runtime, what changed, compliance questions |
-| Its access | `RemoteMCPServer` through kube-apiserver | Its own ServiceAccount, bound to the reader roles namespace by namespace |
-| Its safety | Read-only tools; `RequireApproval` on any future action | It cannot change the cluster |
-| Its report | `OutputSchema` | A structured briefing (top risks with evidence, quick wins, what changed) other tools can read |
+| **A. CLI first** | No new permissions anywhere; reuses existing code; ships first | Laptop only |
+| **B. kubescape deployment** | No new permissions for storage | A second endpoint for agents |
+| **C. storage** | One endpoint for agents | Bigger change; storage needs to read Services and RBAC (needs the roadmap 1.1 review) |
 
-It is off by default:
+**Proposed:** start with A, prove the ranking on real clusters, then choose B or C together with the maintainers.
+The ranking code is one package either way.
+
+### 7.7 Who can see what
+
+- Agents reach the tools exactly as today, through kube-apiserver, with every read checked against their RBAC.
+- A signal uses only objects the caller may read. Example: an agent that may not read RBAC objects in `shop` gets
+  `"blast_radius": {"value": "unknown", "reason": "no permission to read RBAC objects"}`, never the binding names.
+- The chart's optional reader roles get one more role for Services, Ingresses, NetworkPolicies and RBAC objects
+  (`get` and `list` only), bound separately so operators decide.
+
+### 7.8 The Kubescape Security Agent
+
+A ready-made Kagent agent, built only on Kagent 1.0 features:
+
+| Part | Kagent feature | What it gives |
+|---|---|---|
+| The agent | `AgentTemplate`, `Agent` | A security agent that can use only Kubescape's read tools |
+| Its know-how | Agent skills | A **Kubescape skill**: how to triage, explain a workload, harden from runtime, report what changed |
+| Its access | `RemoteMCPServer` through kube-apiserver | Its own ServiceAccount, bound to reader roles per namespace |
+| Its safety | Read-only tools; `RequireApproval` for any future action | It cannot change the cluster |
+| Its report | `OutputSchema` | A structured daily briefing other tools can read |
+
+Turning it on:
 
 ```yaml
 # helm-charts: charts/kubescape-operator/values.yaml (proposed)
 kagent:
   securityAgent:
-    enabled: false
-    namespaces: []          # namespaces it may read; empty means the release namespace only
-    model: ""               # the Kagent ModelConfig to use
+    enabled: false          # off by default
+    namespaces: [shop, payments]
+    model: my-model-config  # the Kagent ModelConfig to use
 ```
 
-`RemoteMCPServer` cannot trust a custom CA today, and Kagent's gateway verifies upstream certificates itself
-([kagent#3662](https://github.com/kagent-dev/kagent/issues/3662), where we offered the change). Until that lands the
-agent runs on the Gemini CLI path documented in storage's endpoint docs; the chart value stays off.
+Example daily briefing (illustrative shape):
 
-### 6.9 Hardening from runtime
+```text
+Kubescape security briefing, cluster prod, 2026-12-01
+Fix first: grafana (loaded critical CVE, internet-facing, cluster-admin), nginx, traefik
+Quick wins: 3 workloads need only an image upgrade to clear all loaded critical CVEs
+New since yesterday: 2 loaded critical CVEs in payments/api; control C-0016 started failing on shop/web
+```
 
-`explain_workload_risk` includes, when a complete ContainerProfile exists, the configuration drift the CLI already
-computes: "this container never writes to its root filesystem and never uses these capabilities", returned as a
-JSON patch to review. Nothing is applied.
+`RemoteMCPServer` cannot trust a custom CA today ([kagent#3662](https://github.com/kagent-dev/kagent/issues/3662),
+where we offered the change). Until then, the same tools work with the Gemini CLI as documented in storage's endpoint
+docs, and the chart value stays off.
 
-## 7. Evidence and measurements
+### 7.9 Hardening from runtime
+
+`explain_workload_risk` also says how to make the workload safer, from what the container actually did. This is the
+CLI's existing `get_configuration_drift`. For grafana on our cluster it returned:
+
+```json
+[{"YamlExpression": "select(di==0).spec.template.spec.containers[0].securityContext.capabilities.drop |= [\"ALL\"]"}]
+```
+
+In words: "grafana never used any Linux capability while it ran, so it can drop them all." It is returned as a patch
+for a human to review. Nothing is applied.
+
+## 8. Evidence: the measurement on kind
 
 **Setup.** kind (Kubernetes v1.37.0), operator chart 1.42.0 with continuous scanning on, Kubescape storage with
-kubescape#4875. 25 Deployments with 25 common images, mostly 2023 releases (nginx, httpd, traefik, caddy, grafana, registry,
-tomcat, prometheus, redis, memcached, rabbitmq, postgres, mysql, mariadb, mongo, vault, python, node, alpine, ubuntu,
-debian, busybox), set up so the signals differ:
+kubescape#4875. 25 Deployments with 25 common images, mostly 2023 releases (nginx, httpd, traefik, caddy, grafana,
+registry, tomcat, prometheus, redis, memcached, rabbitmq, postgres, mysql, mariadb, mongo, vault, python, node, alpine,
+ubuntu, debian, busybox). They were set up so the signals differ:
 
-- exposure: NodePort Services and Ingresses (external), ClusterIP Services with no NetworkPolicy (open), a deny-all
-  ingress NetworkPolicy (isolated), and no Service;
-- blast radius: ServiceAccounts that can read Secrets, create pods, or are cluster-admin, and the default one;
-- all profiles completed before the run.
+- reachability: NodePort Services and Ingresses (external), plain Services (open), a deny-all NetworkPolicy
+  (isolated), no Service;
+- permissions: ServiceAccounts that can read Secrets, create pods, or are cluster-admin, and the default one;
+- all containers fully profiled before the run (2026-11-13).
 
-The numbers below are from 2026-11-13. The scripts that create the workloads and take the measurements become the
-benchmark of phase 6.
+**Ranked by number of criticals (today) vs by the score:**
 
-**Cost today** is in section 2: 26 to 129 calls and up to 545 KB for one question, growing with the cluster.
-
-**What the signals change**, over all 42,548 vulnerability findings (one CVE in one package of one workload):
-
-| | Findings | Share of Critical + High |
-|---|---|---|
-| Critical + High | 16,180 | 100% |
-| ... in a package the container loads | 4,239 | 26% |
-| ... loaded, and reachable (not isolated) | 3,462 | 21% |
-| ... loaded, reachable from outside the cluster, and the ServiceAccount has permissions | 712 | 4.4% |
-
-**Ordered by severity, as today**, the first 20 findings come from 11 workloads; all 20 are loaded, but only 4 are on
-an externally reachable workload, 4 on a privileged one, and 2 are both.
-
-**Workloads ranked by the score vs by number of criticals** (selected rows):
-
-| Workload | Exposure | Blast radius | Critical + High | Loaded | Rank by criticals | Rank by score |
+| Workload | Reachable | Permissions | Critical + High | Loaded | Rank today | Rank by score |
 |---|---|---|---|---|---|---|
 | grafana | external | cluster-admin | 255 | 183 | 8 | **1** |
 | nginx 1.25 | external | reads Secrets | 372 | 372 | 7 | **2** |
@@ -342,77 +444,97 @@ an externally reachable workload, 4 on a privileged one, and 2 are both.
 | postgres 16 | isolated | none | 442 | 348 | 6 | 21 |
 | mongo | isolated | none | 203 | 170 | 13 | 22 |
 
-The three images with the most critical CVEs load 2 to 4% of them; the workloads an attacker could actually use first
-(exposed and privileged) were ranked 7th to 10th by count. Isolated databases with many loaded CVEs drop to the end:
-they still need patching, but not first.
+```mermaid
+flowchart LR
+  subgraph T["Today: by number of criticals"]
+    direction TB
+    t1["1. httpd (4% loaded, no permissions)"] --> t2["2. redis 7.0 (4% loaded)"] --> t3["3. memcached (2% loaded)"]
+  end
+  subgraph F["Fix What Matters: by score"]
+    direction TB
+    f1["1. grafana (loaded, internet, cluster-admin)"] --> f2["2. nginx (loaded, internet, Secrets)"] --> f3["3. traefik (loaded, internet, pods)"]
+  end
+```
 
-**Limits found by the run.**
-- For nginx, tomcat and rabbitmq the filtered report equals the full one: relevancy did not narrow those images. The
-  ranking still works (the other signals apply), and `relevant` is reported as `yes` for them. Why relevancy keeps
-  every package for these images is a node-agent question to follow up.
-- Ranked one finding at a time, grafana alone fills the top 20; hence ranking by workload (section 6.3).
+Isolated databases with many loaded CVEs drop to the end. They still need patching, just not first.
 
-**Targets.**
+**What the run taught us**
+- Ranked one CVE at a time, grafana alone filled the top 20, so the design ranks workloads (7.3).
+- For nginx, tomcat and rabbitmq the "loaded" report equals the full report: relevancy did not narrow those images.
+  The other signals still rank them sensibly. Why relevancy keeps every package for these images is a node-agent
+  question to follow up.
+
+**Targets**
 
 | Measure | Today | Target |
 |---|---|---|
-| Calls for "what should I fix first in this cluster" | not possible ("top CVEs" alone: 26 calls, 545 KB) | 1 |
-| Bytes an agent reads for it | grows with the cluster | a few KB, fixed budget |
-| Top findings shown with runtime, exposure and permission evidence | none | all |
-| Benchmark questions answerable on a default install | configuration questions return nothing | all |
+| Calls for "what should I fix first" | not possible ("top CVEs" alone: 26 calls, 545 KB) | 1 call |
+| Data the agent reads | grows with the cluster | a few KB, fixed |
+| Top items that say why (loaded, reachable, permissions) | none | all |
+| Questions answerable on a default install | configuration questions return nothing | all |
 | Install to first ranked answer | build your own agent, prompt and RBAC | one Helm value, about 5 minutes |
 
-## 8. Security considerations
+## 9. Security
 
 - Read-only: no tool writes to the cluster or to storage.
-- No widening of access: the ranking reads with the caller's identity and per-read checks (section 6.7).
-- The index holds data storage already stores; it adds no new data and is off by default.
-- New input shapes (filters, cursors) get fuzz tests, and every tool gets an allowed / denied / cross-namespace test.
+- No extra access: the ranking reads as the caller, with every read checked (7.7).
+- The index holds only data storage already has, and is off by default.
+- Every tool is tested with an allowed caller, a denied caller and a caller from another namespace, and new arguments
+  are fuzz-tested.
 - A threat model for the whole MCP surface is written as part of this work (roadmap 1.1).
 
-## 9. Rollout
+## 10. Rollout
+
+```mermaid
+flowchart LR
+  P1["1. Foundations<br/>one copy of the tools,<br/>default-install summaries"] --> P2["2. Query tools<br/>+ index"]
+  P2 --> P3["3. Ranking<br/>in the CLI"]
+  P3 --> P4["4. Security Agent<br/>(Kagent)"]
+  P3 --> P5["5. Ranking in the cluster<br/>(option B or C)"]
+  P4 --> P6["6. Trust + docs<br/>tests, benchmark, guides"]
+  P5 --> P6
+```
 
 | Phase | What | Repos |
 |---|---|---|
-| 1. Foundations | One copy of the read tools (storage-mcp-endpoint.md phase 5, kubescape#4875); tools for the summaries a default install stores; `relevant_only` filters; generated network policies and seccomp profiles readable | kubescape, storage, helm-charts |
-| 2. Query tools | Query contract; index; `top_vulnerabilities`, `find_workloads_by_cve`, `find_workloads_by_package`, `failing_resources_by_control`, `workload_overview` | storage |
-| 3. Ranking | Signals package, score, golden scenario; `what_to_fix_first` and `explain_workload_risk` in `kubescape mcpserver` (option A) | kubescape |
-| 4. Security Agent | Kubescape skill, agent template, chart values, briefing schema, agent evaluation; Kagent CA support upstream | helm-charts, kagent |
-| 5. In-cluster ranking | Option B or C, decided with phase 3's numbers; `changes_since` | kubescape or storage |
-| 6. Trust and docs | Threat model, authorization matrix, fuzzing, MCP case in CI, size budgets, kubescape.io guides | all |
+| 1. Foundations | One copy of the read tools (kubescape#4875); tools for the summaries a default install stores; a `loaded only` filter; generated network policies and seccomp profiles readable | kubescape, storage, helm-charts |
+| 2. Query tools | `top_vulnerabilities`, `find_workloads_by_cve`, `find_workloads_by_package`, `failing_resources_by_control`, `workload_overview`, and the index | storage |
+| 3. Ranking | The signals, the score, the CI test cluster; `what_to_fix_first` and `explain_workload_risk` in `kubescape mcpserver` | kubescape |
+| 4. Security Agent | Kubescape skill, agent template, chart values, briefing; Kagent CA support upstream | helm-charts, kagent |
+| 5. Ranking in the cluster | Option B or C; `changes_since` | kubescape or storage |
+| 6. Trust and docs | Threat model, access tests, fuzzing, CI benchmark with size limits, kubescape.io guides | all |
 
-Each phase ships on its own and is useful without the next one.
+Each phase is useful on its own.
 
-## 10. Test plan
+## 11. Test plan
 
-- Unit tests per signal, including every `unknown` case.
-- The golden scenario (section 6.3) checked in CI.
-- Authorization matrix: every tool × (allowed, denied, other namespace), on the fake reader and on kind.
-- Fuzz tests for filters and cursors.
-- Write-path load test for the index (node-agent profile writes with and without the index).
-- Benchmark and size budgets: the section 7 questions run in CI; a tool that grows past its budget fails.
-- Agent evaluation: 15 to 20 scripted conversations, checking the agent picks the right tools and gives the right
-  answer, run before chart releases.
+- Unit tests for each signal, including every `unknown` case.
+- The fixed test cluster (7.3) checks the ranking order in CI.
+- Every tool × (allowed, denied, other namespace), on fake data and on kind.
+- Fuzz tests for filters and paging.
+- Load test: report saves with and without the index.
+- Benchmark: the questions in section 2 run in CI; a tool whose answer grows past its size limit fails.
+- Agent tests: 15 to 20 scripted conversations, checking the agent picks the right tools and gives the right answer.
 
-## 11. Alternatives considered
+## 12. Alternatives considered
 
 | Alternative | Why not |
 |---|---|
-| Only add filters to the existing per-manifest tools | Still one call per image for cluster-wide questions, and no join of signals |
-| Rank by severity and fixability only | That is what scanners already do; it ignores Kubescape's runtime data |
-| Let the agent join the signals itself | Many calls, large context, and the result depends on the model; a ranking in code is testable and the same for every client |
-| A separate service for the ranking | One more component to deploy and secure; options A to C reuse what is already deployed |
+| Only add filters to the existing tools | Still one call per image for cluster-wide questions, and no "why" |
+| Rank by severity and fix only | That is what every scanner does; it ignores Kubescape's runtime data |
+| Let the agent combine the signals itself | Many calls, large context, and the answer changes with the model; code is testable and the same for everyone |
+| A new service just for ranking | One more thing to deploy and secure; options A to C reuse what is already running |
 
-## 12. Open questions
+## 13. Open questions
 
-1. Option B or C for the in-cluster ranking (section 6.6).
-2. Index storage: a SQLite table next to the metadata, or in memory rebuilt at start-up.
-3. Default weights, and whether they are a chart value or only a config map.
-4. Whether the Security Agent lives in the operator chart or in its own chart.
-5. Whether `blast_radius` should also use attack-path results once [`attack-path-analysis.md`](attack-path-analysis.md)
-   ships, and how the two outputs are kept consistent.
+1. Option B or C for the ranking in the cluster (7.6).
+2. The index: a table next to storage's metadata, or in memory rebuilt at start-up.
+3. The default points, and whether users set them in the chart or in a config map.
+4. Whether the Security Agent lives in the operator chart or its own chart.
+5. Whether blast radius should also use attack-path results once [`attack-path-analysis.md`](attack-path-analysis.md)
+   ships.
 
-## 13. References
+## 14. References
 
 - Roadmap items 5.1 and 1.1, kubescape/project-governance `ROADMAP.md`
 - [`storage-mcp-endpoint.md`](storage-mcp-endpoint.md) and its implementation status
