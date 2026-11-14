@@ -5,6 +5,19 @@
 **Author:** @ye11oc4t  
 **Related work:** [kubescape/kubescape#3242](https://github.com/kubescape/kubescape/pull/3242), [kubescape/kubescape#3243](https://github.com/kubescape/kubescape/pull/3243), [kubescape/kubescape#1987](https://github.com/kubescape/kubescape/issues/1987), [kubescape/kubescape#1992](https://github.com/kubescape/kubescape/pull/1992), [kubescape/kubescape#2207](https://github.com/kubescape/kubescape/issues/2207), [kubescape/kubescape#2419](https://github.com/kubescape/kubescape/issues/2419), [kubescape/kubescape#2813](https://github.com/kubescape/kubescape/issues/2813), [kubescape/kubescape#2814](https://github.com/kubescape/kubescape/issues/2814), [kubescape/kubescape#2815](https://github.com/kubescape/kubescape/pull/2815), [kubescape/kubescape#2960](https://github.com/kubescape/kubescape/issues/2960), [kubescape/kubescape#2965](https://github.com/kubescape/kubescape/pull/2965), [kubescape/kubescape#2010](https://github.com/kubescape/kubescape/issues/2010)
 
+## Implementation baseline update
+
+The implementation series is based on kubescape/kubescape commit
+`2d6dcaf2c0d952e3b22465bfd8c40c0f845a9a11`. At this revision both `Scan` and
+`ScanContext` return `(*ResultsHandler, error)`. Rule-level errors already follow
+the skip-and-continue policy discussed in #4735. The historical invalid-Rego
+reproduction below explains the original proposal; it is not the expected result
+on this baseline. New failure-injection cases use scan-level interruptions.
+
+The proposed rollout consists of five implementation PRs: common finalization,
+typed core outcomes, reporting safeguards, CLI integration and HTTP integration.
+CLI and HTTP both depend on reporting safeguards and can be reviewed separately.
+
 ## 1. Summary
 
 Kubescape does not currently have an explicit contract for a posture scan that produced useful evaluation results but did not complete successfully.
@@ -155,6 +168,7 @@ type ScanOutcome struct {
 }
 
 func (ks *Kubescape) ScanWithOutcome(
+    ctx context.Context,
     scanInfo *cautils.ScanInfo,
     policyIdentifiers []cautils.PolicyIdentifier,
 ) ScanOutcome
@@ -172,13 +186,21 @@ The existing method remains source-compatible:
 func (ks *Kubescape) Scan(
     scanInfo *cautils.ScanInfo,
     policyIdentifiers []cautils.PolicyIdentifier,
-) error {
-    outcome := ks.ScanWithOutcome(scanInfo, policyIdentifiers)
-    return outcome.Err
+) (*resultshandling.ResultsHandler, error) {
+    return ks.ScanContext(ks.Context(), scanInfo, policyIdentifiers)
 }
 ```
 
 Existing callers retain their current fail-on-error behavior until migrated. The compatibility wrapper must not silently print, submit, or otherwise consume a partial result.
+
+`ScanContext` retains its explicit context parameter and tuple return as well.
+The new outcome API is additive; an optional `OutcomeScanner` interface avoids
+requiring new methods on every existing `IKubescape` implementation. Legacy
+callers that inspect a handler after an error do not gain a safety guarantee:
+they must migrate before consuming partial results. The legacy path closes
+writers on error. Outcome callers own finalized handlers and must render them or
+call `Close`; writer closure is idempotent. Dry-run uses the legacy context API
+because it does not produce a posture artifact.
 
 ### 5.3 Error identity
 
@@ -276,6 +298,11 @@ Examples:
 
 The table is a contract boundary, not an instruction to recover from every error. When legality cannot be established, the safe outcome is `failed`.
 
+If finalization fails, discard accumulated results from the public outcome and
+return `failed` with `Results == nil`. Preserve the original interruption as the
+primary cause and expose the finalizer failure as a secondary cause using error
+unwrapping, so both remain accessible through `errors.Is` and `errors.As`.
+
 ### 6.3 Eager processor
 
 The eager processor already performs most required finalization after evaluation failure. It should use the common finalizer, attach explicit partial metadata, and return the original evaluation error.
@@ -330,9 +357,17 @@ Field names may follow the owning report package's conventions. The semantics ar
 - score and coverage finality are explicit; and
 - skipped scan-production stages are distinguished from stages that ran and found nothing.
 
-For v1 wire compatibility, newly produced **complete** posture reports omit the `scanCompletion` block. A **failed** scan produces no posture report. Therefore only a partial artifact introduces this additive block in v1, and any artifact carrying it is self-identifying.
+Reports produced by the new outcome API include `scanCompletion.status` for both
+**complete** and **partial** scans. A **failed** scan produces no posture report.
+This is an additive wire change, not a byte-identical-output guarantee; consumers
+with closed schemas must accept the new field before migrating. JSON, YAML,
+programmatic JSON and HTTP canonical artifacts must all preserve the marker.
+Partial-capable printers must explicitly declare support; other formats reject
+partial rendering until they have an agreed representation.
 
-Absence of the block in an artifact from an unknown or legacy producer means “completion was not explicitly encoded”; it must not be treated as universal proof of completion without producer/version or operation context. The programmatic `ScanOutcome.Completion` is always explicit for new API callers. A future report-schema version may encode `status: complete`, but that is not part of this v1 contract.
+Absence of the block means completion was not explicitly encoded by a legacy or
+unknown producer. New API consumers require the marker instead of interpreting
+absence as complete. The typed outcome and serialized marker must agree.
 
 ### 7.2 Determinism and sanitization
 
@@ -411,33 +446,50 @@ The bounded caller-boundary fixes in #3242 and #3243 may preserve an eager sessi
 ### Phase 1 — centralize idempotent processor finalization
 
 - Extract common coverage, aggregation, skip, summary, and score finalization.
-- Define legal and illegal partial-finalization points.
-- Make repeated finalization harmless.
-- Track resident acceptance and completed namespace scopes in streaming mode.
-- Preserve cancellation and producer shutdown behavior.
+- Make repeated finalization harmless and verify successful eager/streaming parity.
+- Preserve existing success-path scoring and rule-skip behavior.
 
-### Phase 2 — add typed completion metadata
+### Phase 2 — finalized partial state and typed core outcomes
 
 - Add `ScanOutcome` or the agreed equivalent.
-- Add the additive report representation.
+- Define accepted resources, completed evaluations and legal finalization points.
+- Retain an interrupted scope's resources before exposing its completed verdicts.
+- Cancel and join the producer before partial finalization; preserve error identity.
 - Mark scores and coverage final or provisional.
 - Mark unprocessed work without converting failures into passes.
 - Preserve existing `Scan` as a compatibility wrapper.
-- Require the completion block on partial artifacts and omit it on complete v1 artifacts.
+- Preserve writer ownership on both the legacy and outcome API paths.
 
-### Phase 3 — integrate callers
+### Phase 3 — completion serialization and delivery safeguards
+
+- Include completion metadata on complete and partial output from the new API.
+- Keep JSON, YAML and canonical/programmatic JSON representations consistent.
+- Reject unsupported partial formats and sanitize serialized diagnostics.
+- Guard the shared reporting path and complete-report submitter against partials.
+- Keep scan errors, render errors and writer-close errors separately inspectable.
+
+### Phase 4 — CLI integration
 
 - CLI renders finalized partial results and exits non-zero.
-- HTTP preserves a canonical partial artifact and typed failure status.
-- Library callers can distinguish partial from fatal without printing.
-- Reporter rejects or skips partial artifacts under the complete-report protocol.
-- Callers record render, persistence, response, and submission outcomes separately from scan completion.
+- Cover plain scan, framework, control and workload entry points.
+- Exclude partial measurements from final fleet scoring and preserve failure status.
+- Preserve privacy options, dry-run behavior and complete-scan threshold behavior.
 
-### Phase 4 — parity and failure injection
+### Phase 5 — HTTP integration
+
+- Preserve a local canonical partial artifact without invoking operator storage,
+  overwriting complete cluster state, or sweeping records missing from the scan.
+- Use a distinct partial response envelope with artifact/reference and separate
+  delivery status in synchronous responses, polling and completion callbacks.
+- The proposed transport mapping uses HTTP 500 for incomplete scans and a
+  `partialScan` response type. This mapping is subject to HTTP API owner review.
+- Publish canonical JSON atomically and preserve it when sidecar rendering fails.
+
+### Verification in every phase
 
 Exercise eager and streaming paths with:
 
-- invalid Rego;
+- invalid Rego as a skip-and-continue regression, not a scan-level failure;
 - cancellation and deadlines;
 - producer failure before resident input;
 - producer failure after resident or namespace success;
@@ -511,7 +563,12 @@ Tests assert all three invariants:
 
 ### 12.4 Serialization
 
-Golden tests cover JSON and YAML complete, partial, and legacy-compatible output. Complete v1 output omits `scanCompletion`; partial output requires it and includes stable status, scan stage, reason code, finality flags, and known scope information without leaking raw failure contents; failed scans produce no posture artifact. Programmatic tests require an explicit completion enum for every `ScanWithOutcome` return.
+Golden tests cover JSON and YAML complete, partial, and legacy output. New API
+artifacts require an explicit status for both complete and partial results.
+Partial metadata includes stable status, failure stage, reason code, finality
+flags and known scope information without exposing raw error contents. Failed
+scans produce no posture artifact. Programmatic tests require an explicit enum
+for every `ScanWithOutcome` return.
 
 ## 13. Acceptance criteria
 
@@ -524,7 +581,7 @@ Golden tests cover JSON and YAML complete, partial, and legacy-compatible output
 - [ ] HTTP exposes both the artifact and typed failure status.
 - [ ] Partial output is not uploaded as a complete report.
 - [ ] Render, persistence, HTTP response, and submission failures remain separate from `ScanCompletion` and `ScanOutcome.Err`.
-- [ ] Complete v1 reports omit `scanCompletion`; partial reports require `scanCompletion.status: partial`; failed scans emit no posture report.
+- [ ] New API reports require explicit complete/partial metadata; legacy absence means unspecified; failed scans emit no posture report.
 - [ ] Writer closure remains exactly once across fatal, partial, and success paths.
 - [ ] `errors.Is` and `errors.As` work for cancellation, deadline, evaluator, and producer errors.
 - [ ] Eager and streaming failure-injection tests pass under `-race`.
