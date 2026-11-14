@@ -8,7 +8,7 @@
 ## Implementation baseline update
 
 The implementation series is based on kubescape/kubescape commit
-`2d6dcaf2c0d952e3b22465bfd8c40c0f845a9a11`. At this revision both `Scan` and
+`465998fa0c9deb53d72217f08e5ab12f0c540efd`. At this revision both `Scan` and
 `ScanContext` return `(*ResultsHandler, error)`. Rule-level errors already follow
 the skip-and-continue policy discussed in #4735. The historical invalid-Rego
 reproduction below explains the original proposal; it is not the expected result
