@@ -4,7 +4,10 @@
 - **Author:** Sarthak Shreshtha ([@Sarthak-Shreshtha01](https://github.com/Sarthak-Shreshtha01))
 - **Date:** 2026-11-13
 - **Scope:** [`kubescape`](https://github.com/kubescape/kubescape) (ranking, MCP tools), [`storage`](https://github.com/kubescape/storage)
-  (query tools and index), [`helm-charts`](https://github.com/kubescape/helm-charts) (values, roles, Kagent agent),
+  (query tools, index, exploit fields), [`kubevuln`](https://github.com/kubescape/kubevuln) (KEV and EPSS),
+  [`helm-charts`](https://github.com/kubescape/helm-charts) (values, roles, Kagent agent),
+  [`headlamp-plugin`](https://github.com/kubescape/headlamp-plugin) ("Fix first" view),
+  [`prometheus-exporter`](https://github.com/kubescape/prometheus-exporter) (risk metrics),
   [`kubescape.io`](https://github.com/kubescape/kubescape.io) (guides)
 - **Roadmap:** item 5.1, Kagent and MCP support; item 1.1, API hardening (the MCP surface)
 - **Builds on:** [`storage-mcp-endpoint.md`](storage-mcp-endpoint.md) (the in-cluster MCP endpoint)
@@ -23,13 +26,17 @@ This proposal lets Kubescape answer one question, for people and for AI agents:
 > **"What should I fix first, and why?"**
 
 The answer is a short ranked list of workloads. Each one says **why** it is on the list: the vulnerable code is loaded,
-someone outside can reach it, its ServiceAccount can do damage, and a fix exists.
+the CVE is being exploited in the wild, someone outside can reach it, its ServiceAccount can do damage, and a fix exists.
 
-It has three parts:
+It has five parts:
 
-1. **A ranking** that joins four checks Kubescape already does into one simple score.
+1. **A ranking** that joins five checks Kubescape already does (or does in the CLI only) into one simple score, for
+   vulnerabilities and misconfigurations alike, honouring SecurityExceptions.
 2. **Query tools** that answer cluster-wide questions in one call, instead of an agent opening every report.
-3. **The Kubescape Security Agent**: a ready-made Kagent agent that uses these tools, behind one Helm value.
+3. **A fix plan**: the few actions (image upgrades, or workarounds when no fix exists) that clear the most risk.
+4. **The Kubescape Security Agent**: a ready-made Kagent agent that uses these tools, behind one Helm value.
+5. **The same ranking without an agent**: a "Fix first" view in the Headlamp plugin, a `kubescape prioritize` command,
+   and risk metrics for Prometheus.
 
 Everything is read-only, limited by the caller's own RBAC, and off by default.
 
@@ -136,11 +143,13 @@ permissions. Meanwhile grafana, which is reachable from outside the cluster and 
 
 | Word | Meaning |
 |---|---|
-| **Finding** | One vulnerability in one package of one workload. |
+| **Finding** | One vulnerability in one package of one workload, or one failing control on one workload. |
 | **Loaded** (relevant) | The vulnerable package was loaded by the container when it ran (node-agent's relevancy data). |
+| **Exploited** | The CVE is in CISA's Known Exploited Vulnerabilities list (KEV), or has a high EPSS score (the chance it is exploited in the next 30 days). |
 | **Exposure** | Who can reach the workload: `external` (from outside the cluster), `open` (any pod), `isolated` (a NetworkPolicy blocks it). |
 | **Blast radius** | What the workload's ServiceAccount can do if an attacker takes the workload over. |
-| **Signal** | One of the four checks: loaded, exposure, blast radius, fixable. |
+| **Signal** | One of the five checks: loaded, exploited, exposure, blast radius, fixable. |
+| **Action** | One change that clears findings: an image upgrade, or a workaround when no fix exists. |
 
 ## 5. What exists today
 
@@ -153,6 +162,11 @@ The pieces exist. Nobody joins them, and in-cluster agents cannot reach most of 
 | Exposure joined with CVEs | `core/pkg/vulnexposure.Correlate` | No, CLI only |
 | Blast radius | `core/pkg/rbacgraph` (escalation paths), `core/pkg/attackpath` (workload → ServiceAccount) | No, CLI only (`analyze_rbac_escalation_paths`) |
 | Fix available | every vulnerability report | Yes, one report at a time |
+| Exploited (KEV, EPSS) | CLI image scan (kubescape#4207, #4453, #4520) | No: kubevuln does not keep it, and storage's vulnerability report has no field for it |
+| Failing controls | configuration scan summaries (stored by a default install) | Partly: no tool reads the summaries |
+| Accepted risk | `SecurityException` / `ClusterSecurityException` (`kubescape.io/v1beta1`, vulnerabilities and posture) | No: the CLI applies them to scans only |
+| Upgrade advice | the Headlamp plugin's upgrade list (`src/vulnerabilities/upgrades.ts`) | No, UI only |
+| Workarounds | generated NetworkPolicies, seccomp profiles (storage) | Not through any tool |
 | Hardening from runtime | `get_configuration_drift` | No, CLI only |
 
 (Checked against kubescape master `8ab01ea5` and storage main `b15ceb6d`.)
@@ -166,11 +180,14 @@ The pieces exist. Nobody joins them, and in-cluster agents cannot reach most of 
 - The score is simple, written down, configurable, and checked in CI.
 - Cluster-wide questions take one call instead of "list everything, then open each one".
 - A working security agent from one Helm value.
+- When no fix exists, a workaround Kubescape already generated, with the score it leads to.
+- One ranking, read the same way by agents, the Headlamp plugin, the CLI and Prometheus.
 
 **Non-goals**
 - An attack-path engine. [`attack-path-analysis.md`](attack-path-analysis.md) owns multi-step paths.
 - Summary-first output for the scan tools ([kubescape#4200](https://github.com/kubescape/kubescape/issues/4200)).
-- VEX, runtime event history, forensics.
+- VEX ingestion, runtime event history, forensics.
+- Blocking deployments on the score (admission). The CLI's `--fail-on-score` is for CI pipelines only.
 - Anything that changes the cluster. Fixes are suggestions for a human to apply.
 
 ## 7. Design
@@ -181,6 +198,9 @@ The pieces exist. Nobody joins them, and in-cluster agents cannot reach most of 
 flowchart TB
   KA["Kubescape Security Agent (Kagent)"] --> API
   OC["Any MCP client<br/>(Gemini CLI, Claude, kubescape mcpserver)"] --> API
+  HL["Headlamp plugin<br/>'Fix first' view"] --> API
+  CLI["kubescape prioritize"] --> R
+  PE["prometheus-exporter<br/>risk metrics"] --> R
   API["kube-apiserver<br/>who is calling? may they use the endpoint?"] --> EP
   subgraph STR["Kubescape storage: MCP endpoint (already built)"]
     EP["checks every read against the caller's RBAC,<br/>limits size and time"]
@@ -188,20 +208,23 @@ flowchart TB
     EP --> QT["new query tools (7.4)"]
     QT --> IDX[("small index (7.5)")]
   end
-  EP --> R["ranking (7.3):<br/>loaded + exposure + blast radius + fix → score"]
+  EP --> R["ranking (7.3):<br/>loaded + exploited + exposure + blast radius + fix<br/>− accepted exceptions → score"]
+  R --> FP["fix plan (7.10)<br/>upgrades + workarounds"]
 ```
 
-### 7.2 The four signals
+### 7.2 The five signals
 
-For every workload, Kubescape answers four questions:
+For every workload, Kubescape answers five questions:
 
 ```mermaid
 flowchart LR
   W["A workload with a<br/>critical CVE"] --> Q1{"Is the vulnerable<br/>package loaded?"}
+  W --> Q5{"Is it exploited<br/>in the wild?"}
   W --> Q2{"Who can<br/>reach it?"}
   W --> Q3{"What can its<br/>ServiceAccount do?"}
   W --> Q4{"Is there<br/>a fix?"}
   Q1 --> S["score + reasons"]
+  Q5 --> S
   Q2 --> S
   Q3 --> S
   Q4 --> S
@@ -210,6 +233,7 @@ flowchart LR
 | Signal | Possible values | Example from our cluster | Where the answer comes from |
 |---|---|---|---|
 | **Loaded** | yes, no, unknown | grafana: 183 of 255 Critical/High packages loaded; httpd: 154 of 3,850 | the filtered vulnerability report |
+| **Exploited** | known (KEV), likely (high EPSS), no, unknown | not stored in the cluster today (7.11) | kubevuln, from grype's KEV and EPSS data |
 | **Exposure** | external, open, isolated, unknown | grafana: NodePort Service → external; postgres 16: deny-all NetworkPolicy → isolated | Services, Ingress, routes, NetworkPolicies |
 | **Blast radius** | cluster, namespace, none, unknown | grafana: cluster-admin → cluster; nginx: can read Secrets → namespace | RoleBindings, ClusterRoleBindings |
 | **Fixable** | yes, no | grafana: 159 of the 183 loaded have a fixed version | the vulnerability report |
@@ -225,11 +249,15 @@ Points for each signal, added up. One small table:
 |---|---|
 | Severity | Critical 40, High 30, Medium 15, Low 5 |
 | Loaded | yes 30, unknown 15, no 0 |
+| Exploited | known (KEV) 30, likely (EPSS ≥ 0.1) 15, unknown 8, no 0 |
 | Exposure | external 25, open 15, isolated 0, unknown 10 |
 | Blast radius | cluster 25, namespace 15, none 0, unknown 8 |
 | Fixable | yes 10, no 0 |
+| Accepted by a SecurityException | the finding moves below every finding that is not accepted (7.13) |
 
-**Worked example**, two real findings from our cluster:
+**Worked example**, two real findings from our cluster. The exploited signal is left out here because the cluster does
+not store it yet (7.11); when the data is missing for the whole cluster, the signal is dropped for everyone and the
+answer says so, rather than giving every finding `unknown` points.
 
 | | grafana: CVE-2024-45337 in golang.org/x/crypto | httpd: CVE-2026-111497 in libbrotli1 |
 |---|---|---|
@@ -245,6 +273,8 @@ libbrotli1 and has no permissions. Same severity, very different risk, and the s
 
 Rules:
 - `unknown` gets middle points, so missing data neither hides a finding nor pushes it up.
+- **Failing controls are findings too** (7.12). They use the same table, so a privileged container on an
+  internet-facing, cluster-admin workload ranks next to a loaded critical CVE.
 - **Workloads are ranked, not single CVEs.** A workload's score is its best finding's score. Ranked one CVE at a time,
   grafana alone filled the whole top 20 in our run, but the fix is one action: upgrade grafana's image.
 - Ties are broken by severity, then by name, so the order never jumps around.
@@ -264,6 +294,8 @@ Rules:
 | `failing_resources_by_control` | Which resources fail control C-Z? (works on a default install) | 50 |
 | `workload_overview` | Everything about one workload in one call | one workload |
 | `changes_since` | What new loaded critical CVEs or failing controls appeared since yesterday? | 50 |
+| `fix_plan` | Which few actions clear the most risk, and what if there is no fix? (7.10) | top 10 actions |
+| `top_exploited` | Which loaded CVEs in the cluster are known to be exploited (KEV) or likely to be (EPSS)? | 20 |
 
 All tools are read-only and follow the same rules as the existing ones: a `limit`, paging, and always `total`,
 `returned` and `truncated` in the answer.
@@ -419,6 +451,86 @@ CLI's existing `get_configuration_drift`. For grafana on our cluster it returned
 In words: "grafana never used any Linux capability while it ran, so it can drop them all." It is returned as a patch
 for a human to review. Nothing is applied.
 
+### 7.10 The fix plan
+
+A ranked list of workloads still leaves the user to work out what to do. `fix_plan` turns findings into **actions** and
+ranks the actions by how much risk they remove.
+
+**Image upgrades.** Findings are grouped by the change that clears them: "upgrade image X to a version that fixes these
+packages". When several workloads run the same image, one upgrade clears all of them, so the action counts every
+workload it touches. The upgrade logic starts from the Headlamp plugin's existing upgrade list
+(`src/vulnerabilities/upgrades.ts`), moved to Go and checked against it on the same reports.
+
+**Workarounds when no fix exists.** For a loaded, reachable finding with no fixed version, the plan offers what
+Kubescape already generated for that workload, with the score it would have afterwards:
+
+| Workaround | Where it comes from | What it changes in the score |
+|---|---|---|
+| Apply the generated NetworkPolicy | node-agent's `GeneratedNetworkPolicy` (only the traffic the workload really used) | exposure `open` → `isolated` |
+| Drop capabilities, read-only root filesystem | runtime drift (7.9) | failing controls on the workload clear |
+| Apply the recorded seccomp profile | storage's `SeccompProfile` | shown as hardening; no points change |
+
+Example answer (illustrative shape; the counts for grafana are from our cluster):
+
+```text
+1. Upgrade the grafana image: clears 159 of 183 loaded Critical/High packages in bench/grafana. Score 130 → 70.
+2. Apply the generated NetworkPolicy to bench/redis70 (no fix for 11 loaded CVEs): exposure open → isolated.
+3. Drop all capabilities in bench/grafana: it used none while running.
+```
+
+Every action is a suggestion with the YAML or the image change spelled out. Nothing is applied.
+
+### 7.11 The exploit signal: KEV and EPSS in the cluster
+
+The CLI's image scan already shows CISA KEV and EPSS and can fail a build on them (kubescape#4207, #4453, #4520). In
+the cluster this is lost: kubevuln gets the data from grype but does not keep it, and storage's vulnerability report
+has no field for it. So an in-cluster agent cannot tell a CVE that attackers use today from one nobody has used.
+
+- **storage:** two optional fields on each vulnerability match in the report: `knownExploited` (date added to KEV) and
+  `epss` (score and percentile). Additive only: old reports and old readers keep working.
+- **kubevuln:** fills them from grype's data, which it already loads for the scan. No new download.
+- **Ranking:** the exploited signal (7.3), and a `top_exploited` tool.
+- **Freshness:** KEV and EPSS change daily; the values are the ones from the last scan, and the answer says when that was.
+
+### 7.12 Misconfigurations as findings
+
+The ranking does not stop at CVEs. A failing control from the configuration scan (privileged container, hostPath,
+runs as root, allows privilege escalation) is a finding with the same signals:
+
+| Signal | For a failing control |
+|---|---|
+| Severity | the control's severity |
+| Loaded | yes: the setting is part of the running workload |
+| Exploited | not used (0) |
+| Exposure, blast radius | the workload's own, as for CVEs |
+| Fixable | yes: every control has a remediation |
+
+It reads the configuration scan summaries a default install already stores, so it works without continuous scanning.
+
+### 7.13 Accepted risk: SecurityExceptions
+
+Users already record accepted risk in `SecurityException` and `ClusterSecurityException` (`kubescape.io/v1beta1`),
+for vulnerabilities and for controls. Today only the CLI's scans apply them. The ranking applies the same matching:
+
+- An accepted finding is marked `accepted`, names the exception, and moves below every finding that is not accepted.
+- It is never hidden: `what_to_fix_first` reports how many findings were accepted, and `include_accepted: true` lists them.
+- An expired exception no longer counts.
+- The matching code is the CLI's, shared, so the scans and the ranking never disagree.
+
+### 7.14 The same ranking without an agent
+
+Not every team runs an agent. The ranking is one Go package, and four front ends read it:
+
+| Front end | What the user gets | Repo |
+|---|---|---|
+| MCP tools (7.4) | agents, including the Security Agent | storage, kubescape |
+| **Headlamp plugin: "Fix first" view** | a ranked table of workloads with the reasons as badges (loaded, exploited, external, cluster-admin), the fix plan beside it, and the user's own RBAC as the limit, as in the rest of the plugin | headlamp-plugin |
+| **`kubescape prioritize`** | the ranking in the terminal: table, JSON and SARIF, `--namespace`, `--top`, and `--fail-on-score N` for CI pipelines | kubescape |
+| **prometheus-exporter** | `kubescape_workload_risk_score{namespace,workload}` and counts of loaded, exploited and exposed findings, for Grafana dashboards and alerts | prometheus-exporter |
+
+The Headlamp view and the CLI read the same answer as `what_to_fix_first`, so a user and their agent always see the
+same order.
+
 ## 8. Evidence: the measurement on kind
 
 **Setup.** kind (Kubernetes v1.37.0), operator chart 1.42.0 with continuous scanning on, Kubescape storage with
@@ -470,15 +582,21 @@ Isolated databases with many loaded CVEs drop to the end. They still need patchi
 |---|---|---|
 | Calls for "what should I fix first" | not possible ("top CVEs" alone: 26 calls, 545 KB) | 1 call |
 | Data the agent reads | grows with the cluster | a few KB, fixed |
-| Top items that say why (loaded, reachable, permissions) | none | all |
+| Top items that say why (loaded, exploited, reachable, permissions) | none | all |
 | Questions answerable on a default install | configuration questions return nothing | all |
 | Install to first ranked answer | build your own agent, prompt and RBAC | one Helm value, about 5 minutes |
+| Top findings with an action (upgrade or workaround) | none | all |
+| Ways to see the ranking | none | MCP, Headlamp, CLI, Prometheus |
 
 ## 9. Security
 
 - Read-only: no tool writes to the cluster or to storage.
 - No extra access: the ranking reads as the caller, with every read checked (7.7).
 - The index holds only data storage already has, and is off by default.
+- The KEV and EPSS fields are optional and additive: no stored report changes shape for existing readers.
+- The Headlamp view reads as the logged-in user, like the rest of the plugin; the Prometheus metrics carry only scores
+  and counts, never CVE details or object contents.
+- SecurityExceptions only move findings down; they never hide them.
 - Every tool is tested with an allowed caller, a denied caller and a caller from another namespace, and new arguments
   are fuzz-tested.
 - A threat model for the whole MCP surface is written as part of this work (roadmap 1.1).
@@ -493,6 +611,9 @@ flowchart LR
   P3 --> P5["5. Ranking in the cluster<br/>(option B or C)"]
   P4 --> P6["6. Trust + docs<br/>tests, benchmark, guides"]
   P5 --> P6
+  P3 --> P7["7. Exploit signal<br/>+ misconfigurations<br/>+ exceptions"]
+  P7 --> P8["8. Fix plan + Headlamp,<br/>CLI, Prometheus"]
+  P8 --> P6
 ```
 
 | Phase | What | Repos |
@@ -503,6 +624,8 @@ flowchart LR
 | 4. Security Agent | Kubescape skill, agent template, chart values, briefing; Kagent CA support upstream | helm-charts, kagent |
 | 5. Ranking in the cluster | Option B or C; `changes_since` | kubescape or storage |
 | 6. Trust and docs | Threat model, access tests, fuzzing, CI benchmark with size limits, kubescape.io guides | all |
+| 7. Exploit signal, misconfigurations, exceptions | KEV and EPSS fields in the report and filled by kubevuln; `top_exploited`; failing controls as findings; SecurityException matching shared with the CLI | storage, kubevuln, kubescape |
+| 8. Fix plan and front ends | `fix_plan` (upgrades and workarounds); "Fix first" view in Headlamp; `kubescape prioritize`; risk metrics in prometheus-exporter | kubescape, storage, headlamp-plugin, prometheus-exporter |
 
 Each phase is useful on its own.
 
@@ -515,6 +638,13 @@ Each phase is useful on its own.
 - Load test: report saves with and without the index.
 - Benchmark: the questions in section 2 run in CI; a tool whose answer grows past its size limit fails.
 - Agent tests: 15 to 20 scripted conversations, checking the agent picks the right tools and gives the right answer.
+- kubevuln: a scan of an image with a known KEV CVE stores `knownExploited` and `epss`; old reports still decode.
+- SecurityExceptions: the same exceptions give the same result in a CLI scan and in the ranking (shared test cases),
+  including expired ones.
+- Fix plan: the upgrade advice matches the Headlamp plugin's on the same reports; each workaround's "score after" is
+  checked by applying it on kind and ranking again.
+- Front ends: the CLI's JSON and the MCP answer are compared in CI; Headlamp view tests on recorded answers; the
+  exporter's metrics checked on the test cluster.
 
 ## 12. Alternatives considered
 
@@ -533,6 +663,9 @@ Each phase is useful on its own.
 4. Whether the Security Agent lives in the operator chart or its own chart.
 5. Whether blast radius should also use attack-path results once [`attack-path-analysis.md`](attack-path-analysis.md)
    ships.
+6. KEV and EPSS: fields on each match in the vulnerability report (proposed), or a separate small object per image.
+7. Whether VEX `not_affected` statements, once ingested, should count like an accepted exception.
+8. Where the shared ranking package lives so that the CLI, storage and prometheus-exporter can all import it.
 
 ## 14. References
 
@@ -540,4 +673,8 @@ Each phase is useful on its own.
 - [`storage-mcp-endpoint.md`](storage-mcp-endpoint.md) and its implementation status
 - `core/pkg/vulnexposure`, `core/pkg/exposure`, `core/pkg/networkpolicy`, `core/pkg/rbacgraph`, `core/pkg/attackpath`
   in kubescape
+- KEV and EPSS in the CLI image scan: kubescape#4207, #4453, #4520
+- SecurityException CRDs: `charts/kubescape-operator/crds/security-exception.crd.yaml` in helm-charts;
+  `core/cautils/getter/crdexceptionsgetter.go` in kubescape
+- Headlamp plugin upgrade list: `src/vulnerabilities/upgrades.ts` in headlamp-plugin
 - [kagent-dev/kagent#3662](https://github.com/kagent-dev/kagent/issues/3662): custom CA for `RemoteMCPServer`
