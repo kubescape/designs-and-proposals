@@ -293,7 +293,7 @@ Rules:
 | `find_workloads_by_package` | Which workloads ship package Y? | 50 |
 | `failing_resources_by_control` | Which resources fail control C-Z? (works on a default install) | 50 |
 | `workload_overview` | Everything about one workload in one call | one workload |
-| `changes_since` | What new loaded critical CVEs or failing controls appeared since yesterday? | 50 |
+| `changes_since` | What new, newly loaded, reappeared or resolved findings are there since a time? Uses the history table (7.5) | 50 |
 | `fix_plan` | Which few actions clear the most risk, and what if there is no fix? (7.10) | top 10 actions |
 | `top_exploited` | Which loaded CVEs in the cluster are known to be exploited (KEV) or likely to be (EPSS)? | 20 |
 
@@ -364,6 +364,36 @@ flowchart LR
 - Off by default (`storage.mcp.index.enabled`), rebuilt at start-up, with metrics.
 - The PR that adds it includes a load test showing writes are not slowed down.
 - Answers are still filtered by what the caller may read.
+
+**History, for `changes_since`.** The index above holds only the current state and may be rebuilt, so it cannot say
+what is new. `changes_since` needs a separate, durable history table, in storage's existing SQLite database (a new schema migration), that is **never
+rebuilt**:
+
+| Column | Meaning |
+|---|---|
+| finding key | namespace, workload kind and name, container, CVE or control ID, package (not the image digest, so an upgrade that keeps a CVE does not make it "new") |
+| `first_seen` | when storage processed the report that first contained it (seconds after the save) |
+| `first_loaded` | when it was first marked loaded, so "became loaded" is a change too |
+| `last_seen`, `resolved_at` | when it was last present; when a later report no longer had it |
+
+Rules:
+- **Report refresh:** a finding in both the old and the new report keeps its `first_seen`. A finding missing from the
+  new report gets `resolved_at`. If it comes back within the retention window it is reported as `reappeared`, not new.
+- **Restart or index rebuild:** the history is not touched. Storage keeps, per report, the `rv` it last processed
+  (its metadata table already has an `rv` column). A start-up pass processes only reports whose `rv` is newer, so
+  reports still in the in-memory queue at shutdown are not missed and nothing is counted twice. Saves only happen
+  while storage runs, so the only delay is that queue, and such findings are marked `first_seen_at_startup`.
+- **First start (or history just enabled):** every existing finding is recorded as `baseline` and is never reported
+  as new. Each answer carries `tracking_since`; asking for an earlier `since` returns what exists from
+  `tracking_since` on, and says so.
+- **Freshness:** each answer carries `as_of` per workload (the last processed report) and `pending` (reports still in
+  the queue). If `pending > 0`, the answer says `complete: false`.
+- **Deleted workloads:** their open findings get `resolved_at` with the reason `workload removed`.
+- **Retention:** resolved rows are kept 30 days (`storage.mcp.index.historyRetention`), then deleted; open findings are
+  kept while they exist. The table is one row per finding, the same size order as the index.
+- **Paging:** by (`first_seen`, key), so pages stay stable while new reports arrive.
+
+`changes_since` ships only after this table and its tests (restart, rebuild, refresh, re-appearance, retention) land.
 
 ### 7.6 Where the ranking runs
 
@@ -622,7 +652,7 @@ flowchart LR
 | 2. Query tools | `top_vulnerabilities`, `find_workloads_by_cve`, `find_workloads_by_package`, `failing_resources_by_control`, `workload_overview`, and the index | storage |
 | 3. Ranking | The signals, the score, the CI test cluster; `what_to_fix_first` and `explain_workload_risk` in `kubescape mcpserver` | kubescape |
 | 4. Security Agent | Kubescape skill, agent template, chart values, briefing; Kagent CA support upstream | helm-charts, kagent |
-| 5. Ranking in the cluster | Option B or C; `changes_since` | kubescape or storage |
+| 5. Ranking in the cluster | Option B or C; the history table (7.5), then `changes_since` | kubescape or storage |
 | 6. Trust and docs | Threat model, access tests, fuzzing, CI benchmark with size limits, kubescape.io guides | all |
 | 7. Exploit signal, misconfigurations, exceptions | KEV and EPSS fields in the report and filled by kubevuln; `top_exploited`; failing controls as findings; SecurityException matching shared with the CLI | storage, kubevuln, kubescape |
 | 8. Fix plan and front ends | `fix_plan` (upgrades and workarounds); "Fix first" view in Headlamp; `kubescape prioritize`; risk metrics in prometheus-exporter | kubescape, storage, headlamp-plugin, prometheus-exporter |
@@ -636,6 +666,9 @@ Each phase is useful on its own.
 - Every tool × (allowed, denied, other namespace), on fake data and on kind.
 - Fuzz tests for filters and paging.
 - Load test: report saves with and without the index.
+- History: a finding keeps its `first_seen` across a report refresh, a storage restart and an index rebuild; a removed
+  finding is resolved; one that comes back is `reappeared`; the first start records only `baseline`; resolved rows go
+  after the retention window; `pending > 0` gives `complete: false`.
 - Benchmark: the questions in section 2 run in CI; a tool whose answer grows past its size limit fails.
 - Agent tests: 15 to 20 scripted conversations, checking the agent picks the right tools and gives the right answer.
 - kubevuln: a scan of an image with a known KEV CVE stores `knownExploited` and `epss`; old reports still decode.
@@ -658,7 +691,8 @@ Each phase is useful on its own.
 ## 13. Open questions
 
 1. Option B or C for the ranking in the cluster (7.6).
-2. The index: a table next to storage's metadata, or in memory rebuilt at start-up.
+2. The index: a table next to storage's metadata, or in memory rebuilt at start-up. (The history table for
+   `changes_since` is durable either way.)
 3. The default points, and whether users set them in the chart or in a config map.
 4. Whether the Security Agent lives in the operator chart or its own chart.
 5. Whether blast radius should also use attack-path results once [`attack-path-analysis.md`](attack-path-analysis.md)
