@@ -1,32 +1,15 @@
 # Proposal: Explicit Completion and Partial-Result Contract for Posture Scans
 
-**Status:** Draft
-**Scope:** Kubescape core scan API, OPA processors, CLI, HTTP handlers, and report submission
-**Author:** @ye11oc4t
-**Related work:** [kubescape/kubescape#3242](https://github.com/kubescape/kubescape/issues/3242), [kubescape/kubescape#3243](https://github.com/kubescape/kubescape/pull/3243), [kubescape/kubescape#1987](https://github.com/kubescape/kubescape/issues/1987), [kubescape/kubescape#1992](https://github.com/kubescape/kubescape/pull/1992), [kubescape/kubescape#2207](https://github.com/kubescape/kubescape/issues/2207), [kubescape/kubescape#2419](https://github.com/kubescape/kubescape/issues/2419), [kubescape/kubescape#2813](https://github.com/kubescape/kubescape/issues/2813), [kubescape/kubescape#2814](https://github.com/kubescape/kubescape/issues/2814), [kubescape/kubescape#2815](https://github.com/kubescape/kubescape/pull/2815), [kubescape/kubescape#2960](https://github.com/kubescape/kubescape/issues/2960), [kubescape/kubescape#2965](https://github.com/kubescape/kubescape/pull/2965), [kubescape/kubescape#2010](https://github.com/kubescape/kubescape/issues/2010)
-
-## Implementation baseline update
-
-The implementation series is based on kubescape/kubescape commit
-`d3f3b80c165032ecfa59c242ad5bea5f5e8198ec` (checked 2026-11-15). At this revision both `Scan` and
-`ScanContext` return `(*ResultsHandler, error)`. Rule-level errors already follow
-the skip-and-continue policy implemented by kubescape/kubescape#4832 as part of
-issue kubescape/kubescape#4735. The historical invalid-Rego
-reproduction below explains the original proposal; it is not the expected result
-on this baseline. New failure-injection cases use scan-level interruptions.
-
-The proposed rollout consists of five implementation PRs: common finalization,
-typed core outcomes, reporting safeguards, CLI integration and HTTP integration.
-CLI and HTTP both depend on reporting safeguards and can be reviewed separately.
-
-The merged `LocalScanner.Scan` and `ScanToReport` APIs from
-kubescape/kubescape#4902 retain their existing error behavior. They do not acquire
-partial-result semantics implicitly; migration requires opting into this
-contract. The writer work in open kubescape/kubescape#4925 addresses global
-deferred truncation and needs coordination with Phase 3's deferred writer
-acquisition. It is not a prerequisite for the completion model. The merged
-output-contract proposal kubescape/designs-and-proposals#26 is a related design,
-not approval of this proposal or of an image-streaming implementation.
+- **Status:** Draft – discussion
+- **Author:** [@ye11oc4t](https://github.com/ye11oc4t)
+- **Date:** 2026-08-25 (updated 2026-11-15)
+- **Scope:** Kubescape core scan API, OPA processors, CLI, HTTP handlers,
+  report serialization and submission
+- **Tracking:** [kubescape/kubescape#3244](https://github.com/kubescape/kubescape/issues/3244)
+- **Related:** [bounded eager fix](https://github.com/kubescape/kubescape/pull/3243),
+  [rule-error behavior](https://github.com/kubescape/kubescape/pull/4832),
+  [local scans](https://github.com/kubescape/kubescape/pull/4902), and
+  [output contracts](./streaming-printer-api-and-output-contracts.md)
 
 ## 1. Summary
 
@@ -460,6 +443,30 @@ Streaming failures must preserve the cancellation and join guarantees establishe
 
 ## 10. Compatibility and rollout
 
+### Current implementation context
+
+This proposal was checked against kubescape/kubescape master commit `6672db7`
+on 2026-11-15. At that revision, `Scan` and `ScanContext` still return
+`(*ResultsHandler, error)`. Rule-level errors follow the skip-and-continue policy
+from kubescape/kubescape#4832, so scan-level interruptions rather than invalid
+Rego drive the partial-outcome failure cases.
+
+The merged `LocalScanner.Scan` and `ScanToReport` APIs from
+kubescape/kubescape#4902 retain their fail-on-error behavior and do not acquire
+partial-result semantics implicitly. The baseline also includes
+kubescape/kubescape#4939's JSON/YAML nil-report dispatch guard.
+
+A candidate Phase 1 refactor is published as Draft
+[kubescape/kubescape#4960](https://github.com/kubescape/kubescape/pull/4960) so
+the finalization boundary can be reviewed concretely. It adds no public outcome
+API or serialization contract and does not imply agreement on the questions in
+section 14. No follow-on implementation PRs have been opened.
+
+Open kubescape/kubescape#4925 addresses global deferred truncation and needs
+coordination with Phase 3's deferred writer acquisition; it is not a prerequisite
+for the completion model. The merged output-contract proposal
+kubescape/designs-and-proposals#26 is related work, not approval of this proposal.
+
 ### Phase 0 — preserve an already-finalized eager session
 
 The bounded caller-boundary fixes in #3242 and #3243 may preserve an eager session that is already finalized while retaining the processing error. They do not automatically print or submit partial output and do not define the final public contract.
@@ -617,4 +624,23 @@ for every `ScanWithOutcome` return.
 6. What HTTP status and envelope best preserve both a partial artifact and independent delivery failure?
 7. Which failure reason codes belong in the stable report schema for the first version?
 
-Implementation beyond the bounded Phase 0 caller fix should wait for agreement on these API and serialization questions.
+Draft implementation may be used to test feasibility, but no public API,
+serialization, CLI, or HTTP phase should be treated as ready until these
+questions are answered.
+
+## 15. References
+
+- [kubescape/kubescape#3242](https://github.com/kubescape/kubescape/issues/3242)
+  and [#3243](https://github.com/kubescape/kubescape/pull/3243): bounded eager
+  result preservation and the original design request.
+- Earlier result/error-path work:
+  [#1987](https://github.com/kubescape/kubescape/issues/1987),
+  [#1992](https://github.com/kubescape/kubescape/pull/1992),
+  [#2207](https://github.com/kubescape/kubescape/issues/2207),
+  [#2419](https://github.com/kubescape/kubescape/issues/2419),
+  [#2813](https://github.com/kubescape/kubescape/issues/2813),
+  [#2814](https://github.com/kubescape/kubescape/issues/2814),
+  [#2815](https://github.com/kubescape/kubescape/pull/2815),
+  [#2960](https://github.com/kubescape/kubescape/issues/2960),
+  [#2965](https://github.com/kubescape/kubescape/pull/2965), and
+  [#2010](https://github.com/kubescape/kubescape/issues/2010).
