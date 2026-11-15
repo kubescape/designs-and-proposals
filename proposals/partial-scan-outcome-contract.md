@@ -1,8 +1,8 @@
 # Proposal: Explicit Completion and Partial-Result Contract for Posture Scans
 
-**Status:** Draft  
-**Scope:** Kubescape core scan API, OPA processors, CLI, HTTP handlers, and report submission  
-**Author:** @ye11oc4t  
+**Status:** Draft
+**Scope:** Kubescape core scan API, OPA processors, CLI, HTTP handlers, and report submission
+**Author:** @ye11oc4t
 **Related work:** [kubescape/kubescape#3242](https://github.com/kubescape/kubescape/issues/3242), [kubescape/kubescape#3243](https://github.com/kubescape/kubescape/pull/3243), [kubescape/kubescape#1987](https://github.com/kubescape/kubescape/issues/1987), [kubescape/kubescape#1992](https://github.com/kubescape/kubescape/pull/1992), [kubescape/kubescape#2207](https://github.com/kubescape/kubescape/issues/2207), [kubescape/kubescape#2419](https://github.com/kubescape/kubescape/issues/2419), [kubescape/kubescape#2813](https://github.com/kubescape/kubescape/issues/2813), [kubescape/kubescape#2814](https://github.com/kubescape/kubescape/issues/2814), [kubescape/kubescape#2815](https://github.com/kubescape/kubescape/pull/2815), [kubescape/kubescape#2960](https://github.com/kubescape/kubescape/issues/2960), [kubescape/kubescape#2965](https://github.com/kubescape/kubescape/pull/2965), [kubescape/kubescape#2010](https://github.com/kubescape/kubescape/issues/2010)
 
 ## Implementation baseline update
