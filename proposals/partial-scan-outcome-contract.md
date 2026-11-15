@@ -3,20 +3,30 @@
 **Status:** Draft  
 **Scope:** Kubescape core scan API, OPA processors, CLI, HTTP handlers, and report submission  
 **Author:** @ye11oc4t  
-**Related work:** [kubescape/kubescape#3242](https://github.com/kubescape/kubescape/pull/3242), [kubescape/kubescape#3243](https://github.com/kubescape/kubescape/pull/3243), [kubescape/kubescape#1987](https://github.com/kubescape/kubescape/issues/1987), [kubescape/kubescape#1992](https://github.com/kubescape/kubescape/pull/1992), [kubescape/kubescape#2207](https://github.com/kubescape/kubescape/issues/2207), [kubescape/kubescape#2419](https://github.com/kubescape/kubescape/issues/2419), [kubescape/kubescape#2813](https://github.com/kubescape/kubescape/issues/2813), [kubescape/kubescape#2814](https://github.com/kubescape/kubescape/issues/2814), [kubescape/kubescape#2815](https://github.com/kubescape/kubescape/pull/2815), [kubescape/kubescape#2960](https://github.com/kubescape/kubescape/issues/2960), [kubescape/kubescape#2965](https://github.com/kubescape/kubescape/pull/2965), [kubescape/kubescape#2010](https://github.com/kubescape/kubescape/issues/2010)
+**Related work:** [kubescape/kubescape#3242](https://github.com/kubescape/kubescape/issues/3242), [kubescape/kubescape#3243](https://github.com/kubescape/kubescape/pull/3243), [kubescape/kubescape#1987](https://github.com/kubescape/kubescape/issues/1987), [kubescape/kubescape#1992](https://github.com/kubescape/kubescape/pull/1992), [kubescape/kubescape#2207](https://github.com/kubescape/kubescape/issues/2207), [kubescape/kubescape#2419](https://github.com/kubescape/kubescape/issues/2419), [kubescape/kubescape#2813](https://github.com/kubescape/kubescape/issues/2813), [kubescape/kubescape#2814](https://github.com/kubescape/kubescape/issues/2814), [kubescape/kubescape#2815](https://github.com/kubescape/kubescape/pull/2815), [kubescape/kubescape#2960](https://github.com/kubescape/kubescape/issues/2960), [kubescape/kubescape#2965](https://github.com/kubescape/kubescape/pull/2965), [kubescape/kubescape#2010](https://github.com/kubescape/kubescape/issues/2010)
 
 ## Implementation baseline update
 
 The implementation series is based on kubescape/kubescape commit
-`465998fa0c9deb53d72217f08e5ab12f0c540efd`. At this revision both `Scan` and
+`d3f3b80c165032ecfa59c242ad5bea5f5e8198ec` (checked 2026-11-15). At this revision both `Scan` and
 `ScanContext` return `(*ResultsHandler, error)`. Rule-level errors already follow
-the skip-and-continue policy discussed in #4735. The historical invalid-Rego
+the skip-and-continue policy implemented by kubescape/kubescape#4832 as part of
+issue kubescape/kubescape#4735. The historical invalid-Rego
 reproduction below explains the original proposal; it is not the expected result
 on this baseline. New failure-injection cases use scan-level interruptions.
 
 The proposed rollout consists of five implementation PRs: common finalization,
 typed core outcomes, reporting safeguards, CLI integration and HTTP integration.
 CLI and HTTP both depend on reporting safeguards and can be reviewed separately.
+
+The merged `LocalScanner.Scan` and `ScanToReport` APIs from
+kubescape/kubescape#4902 retain their existing error behavior. They do not acquire
+partial-result semantics implicitly; migration requires opting into this
+contract. The writer work in open kubescape/kubescape#4925 addresses global
+deferred truncation and needs coordination with Phase 3's deferred writer
+acquisition. It is not a prerequisite for the completion model. The merged
+output-contract proposal kubescape/designs-and-proposals#26 is a related design,
+not approval of this proposal or of an image-streaming implementation.
 
 ## 1. Summary
 
