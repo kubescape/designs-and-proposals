@@ -365,6 +365,17 @@ programmatic JSON and HTTP canonical artifacts must all preserve the marker.
 Partial-capable printers must explicitly declare support; other formats reject
 partial rendering until they have an agreed representation.
 
+The existing v1 JSON framework object/array representation remains on the legacy
+scan API. CLI and HTTP select that path automatically for v1 JSON; direct new-API
+calls reject it before creating output writers. Users must select v2 JSON to
+receive the explicit outcome contract. A silent terminal UI does not suppress
+the completion marker in the separate machine-readable artifact.
+
+The failing stage comes from the boundary that originated the primary error.
+Producer errors remain collection failures even if observed during evaluation;
+evaluation and finalization retain their own stages. Wrapping and joining errors
+must preserve both `errors.Is` and `errors.As` identity.
+
 Absence of the block means completion was not explicitly encoded by a legacy or
 unknown producer. New API consumers require the marker instead of interpreting
 absence as complete. The typed outcome and serialized marker must agree.
