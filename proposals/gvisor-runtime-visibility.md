@@ -1,14 +1,15 @@
 # Proposal: First runtime signals from gVisor sandboxes
 
-- **Status:** Proposed experiment
+- **Status:** Experiment completed; see [results](gvisor-runtime-visibility-results.md)
 - **Author:** Daksh Pathak (<daksh.pathak.ug24@nsut.ac.in>)
 - **Related work:** [Agent Sandbox CRD posture scanning](agent-sandbox-crd-scanning.md)
 - **Related runtime design:** [designs-and-proposals#14](https://github.com/kubescape/designs-and-proposals/pull/14)
 - **Initial implementation target:** [kubescape/node-agent](https://github.com/kubescape/node-agent)
 
 This document is based on published gVisor interfaces and the existing
-Kubescape architecture. The runtime experiment below has not yet been run;
-observations and benchmark numbers will be added only after a Linux trial.
+Kubescape architecture. It is kept as written when the experiment was
+proposed. The trials were run afterwards, and their results are in
+[gvisor-runtime-visibility-results.md](gvisor-runtime-visibility-results.md).
 
 ## Summary
 
