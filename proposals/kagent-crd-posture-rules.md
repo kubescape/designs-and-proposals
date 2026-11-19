@@ -308,75 +308,90 @@ remediation text says so.
 
 ### The served-version matrix
 
-This is the single largest false-negative risk in the whole design, and an earlier
-draft of this proposal got it wrong twice. Two facts drive everything below:
+Two facts drive everything below:
 
 1. **A rule fires only on the kinds and versions its `match` block names.** A rule
-   matching only the newest version silently never fires on a cluster storing an
-   older one, and **nothing in the test harness catches that** — fixtures exercise
-   the rule body, not the match block. A missing version is invisible until an
-   audit misses a real misconfiguration.
-2. **These are alpha APIs whose field paths move between versions.** The same
-   logical field lives at a different path, under a different name, or not at all
-   depending on the version served.
+   matching the wrong group or version silently never fires, and **nothing in the
+   test harness catches that**: fixtures exercise the rule body, not the match
+   block.
+2. **These are alpha APIs whose field paths move between releases.** The 0.10.x
+   line served `kagent.dev` kinds at `v1alpha1`–`v1alpha3`. Kagent v1.0.0 replaced
+   them with a new group and a different set of kinds.
+
+#### Baseline
+
+The supported baseline is **Kagent v1.0.x**, pinned at
+[`v1.0.1`](https://github.com/kagent-dev/kagent/releases/tag/v1.0.1)
+(`558e3d761d8ed2b0d23bfef1867a9d1915210121`). Every kind, version and field path
+in this section was read from the CRD chart at that commit,
+[`helm/kagent-crds/templates/`](https://github.com/kagent-dev/kagent/tree/558e3d761d8ed2b0d23bfef1867a9d1915210121/helm/kagent-crds/templates).
+CEL rules quoted below come from the same files.
+
+The 0.10.x `kagent.dev` kinds are out of scope. Supporting them as well would mean
+every `match` block names both groups, and the per-version path fan-out in the
+previous revision of this section would come back.
 
 #### Served versions, per kind
 
-| Kind | Served versions |
-|---|---|
-| `Agent` | `v1alpha1`, `v1alpha2` |
-| `SandboxAgent` | `v1alpha2`, `v1alpha3` |
-| `ModelConfig` | `v1alpha1`, `v1alpha2`, `v1alpha3` |
-| `RemoteMCPServer` | `v1alpha2`, `v1alpha3` |
-| `ModelProviderConfig` | `v1alpha2`, `v1alpha3` |
-| `ToolServer` | `v1alpha1` |
+All eight kinds are in group `api.kagent.dev`, namespaced, and served and stored
+only as `v1alpha3`. Nothing in the v1.0.1 chart serves `kagent.dev`.
 
-Note that **`Agent` does not serve `v1alpha3`** and `SandboxAgent` does not serve
-`v1alpha1`. The two kinds overlap only at `v1alpha2`.
-
-#### Per-control kind × version coverage
-
-Every `match` block must be written from this table, not from the newest schema.
-
-| Control | Kinds × versions to match | Version-specific notes |
+| Kind | CRD | What matters here |
 |---|---|---|
-| `C-0310` | `ModelConfig` v1alpha1, v1alpha2, v1alpha3 | **v1alpha1 names the field `apiKeySecretRef`, not `apiKeySecret`**, and has no `apiKeyPassthrough` — the passthrough branch cannot fire there. Its `provider` enum is also shorter (7 values, no `Bedrock`/`Foundry`/`SAPAICore`), so the ambient-identity set on v1alpha1 is only `GeminiVertexAI`, `AnthropicVertexAI`, `Ollama` |
-| `C-0311` | `ModelConfig` **v1alpha2, v1alpha3 only**; `RemoteMCPServer` v1alpha2, v1alpha3 | `ModelConfig/v1alpha1` has no `tls` field at all. Matching it would be harmless but meaningless; a fixture asserting a verdict on it would be testing nothing |
-| `C-0312` | `Agent` v1alpha1, v1alpha2; `SandboxAgent` v1alpha2, v1alpha3; `RemoteMCPServer` v1alpha2, v1alpha3; `ToolServer` v1alpha1 | Four distinct env path shapes — see below |
-| `C-0313` | `RemoteMCPServer` v1alpha2, v1alpha3; `ModelProviderConfig` v1alpha2, v1alpha3; `ToolServer` v1alpha1; `ModelConfig` all three | |
-| `C-0314` | `RemoteMCPServer` v1alpha2, v1alpha3 | |
-| `C-0315` | `Agent` **v1alpha2 only**; `SandboxAgent` v1alpha2, v1alpha3; `RemoteMCPServer` v1alpha2, v1alpha3 | **`Agent/v1alpha1` has no `allowedNamespaces` field** — the cross-namespace attachment pattern was introduced in v1alpha2 |
-| `C-0316` | `Agent` **v1alpha2 only**; `SandboxAgent` v1alpha2, v1alpha3 | `Agent/v1alpha1` has no `sandbox` block. `sandbox.network.allowedDomains` is identical across all three shapes that do have it |
-| `C-0317` | `ToolServer` v1alpha1 | Single served version; the only rule with no version fan-out |
+| `Agent` | [`api.kagent.dev_agents.yaml`](https://github.com/kagent-dev/kagent/blob/558e3d761d8ed2b0d23bfef1867a9d1915210121/helm/kagent-crds/templates/api.kagent.dev_agents.yaml) | `spec` is only `template` (inline or by reference), `harnessRef` and `egressPolicyRefs` |
+| `AgentTemplate` | [`api.kagent.dev_agenttemplates.yaml`](https://github.com/kagent-dev/kagent/blob/558e3d761d8ed2b0d23bfef1867a9d1915210121/helm/kagent-crds/templates/api.kagent.dev_agenttemplates.yaml) | prompts, tools (`mcp`, `subAgent`), skills, plugins |
+| `EgressPolicy` | [`api.kagent.dev_egresspolicies.yaml`](https://github.com/kagent-dev/kagent/blob/558e3d761d8ed2b0d23bfef1867a9d1915210121/helm/kagent-crds/templates/api.kagent.dev_egresspolicies.yaml) | new; `destinations[].origin`, and optional gateway-injected `authentication` |
+| `Harness` | [`api.kagent.dev_harnesses.yaml`](https://github.com/kagent-dev/kagent/blob/558e3d761d8ed2b0d23bfef1867a9d1915210121/helm/kagent-crds/templates/api.kagent.dev_harnesses.yaml) | `kagent`, `claude`, `codex` or `byo`; `env`, `workload`, `substrate` |
+| `ModelConfig` | [`api.kagent.dev_modelconfigs.yaml`](https://github.com/kagent-dev/kagent/blob/558e3d761d8ed2b0d23bfef1867a9d1915210121/helm/kagent-crds/templates/api.kagent.dev_modelconfigs.yaml) | 11 providers; `Mistral` is new |
+| `ModelProviderConfig` | [`api.kagent.dev_modelproviderconfigs.yaml`](https://github.com/kagent-dev/kagent/blob/558e3d761d8ed2b0d23bfef1867a9d1915210121/helm/kagent-crds/templates/api.kagent.dev_modelproviderconfigs.yaml) | `modelConfigTemplate` generates `ModelConfig`s |
+| `RemoteMCPServer` | [`api.kagent.dev_remotemcpservers.yaml`](https://github.com/kagent-dev/kagent/blob/558e3d761d8ed2b0d23bfef1867a9d1915210121/helm/kagent-crds/templates/api.kagent.dev_remotemcpservers.yaml) | `protocol` is `SSE` or `STREAMABLE_HTTP` |
+| `SandboxTemplate` | [`api.kagent.dev_sandboxtemplates.yaml`](https://github.com/kagent-dev/kagent/blob/558e3d761d8ed2b0d23bfef1867a9d1915210121/helm/kagent-crds/templates/api.kagent.dev_sandboxtemplates.yaml) | `workload.image` (the schema requires a digest), `env`, `egressPolicyRefs`, `substrate` |
 
-`SandboxAgent` embeds the same agent spec shape as `Agent`, including
-`allowedNamespaces` and `sandbox.network.allowedDomains`. **Any rule naming `Agent`
-must justify why it does not also name `SandboxAgent`**, and in this control set
-only `C-0312` differs between them — by path, not by presence.
+`SandboxAgent`, `ToolServer`, `AgentHarness` and `Memory` are not shipped at
+v1.0.1, so no rule names them.
 
-#### The four env path shapes for `C-0312`
+#### Per-control kind and field paths
 
-The `deployment` nesting level exists in some versions and not others, so there is
-no single path expression that covers all four:
+Every `match` block names `api.kagent.dev` / `v1alpha3` and the kinds below. With a
+single served version there is no version fan-out; what changed is which kinds
+carry each field.
 
-| Kind / version | Inline env paths |
-|---|---|
-| `Agent/v1alpha1` | `spec.deployment.env` |
-| `Agent/v1alpha2` | `spec.declarative.deployment.env`, `spec.byo.deployment.env` |
-| `SandboxAgent/v1alpha2` | `spec.declarative.deployment.env`, `spec.byo.deployment.env` |
-| `SandboxAgent/v1alpha3` | `spec.declarative.env`, `spec.byo.env` — the `deployment` level is **gone**, and `imageRegistry` moves up with it |
+| Control | Kinds and field paths | Notes against the previous revision |
+|---|---|---|
+| `C-0310` model-credential-source | `ModelConfig`: `spec.apiKeySecret`, `spec.tokenPassthrough`, `spec.actorJwt`. `ModelProviderConfig`: `spec.modelConfigTemplate.auth` | `apiKeyPassthrough` is now `tokenPassthrough`. `actorJwt` is a third credential mode, and CEL allows at most one of `actorJwt`, `apiKeySecret`, `tokenPassthrough`; `actorJwt` passes. CEL already rejects `tokenPassthrough` for `Gemini`, `GeminiVertexAI` and `AnthropicVertexAI`. `Mistral` takes an API key, so it fails without a secret. The SAPAICore case from #18 §4 still holds: `apiKeySecretKey` is unused for it |
+| `C-0311` tls-verification-disabled | `ModelConfig.spec.tls.disableVerify`, `RemoteMCPServer.spec.tls.disableVerify` | `tls` now has only `disableVerify`; `caCertSecretRef` and `disableSystemCAs` are gone. RemoteMCPServer CEL forbids `tls` on an `http://` URL |
+| `C-0312` inline-credentials | `RemoteMCPServer.spec.headersFrom[].value`, `ModelConfig.spec.azureOpenAI.azureAdToken`, `ModelConfig.spec.defaultHeaders`, `Harness.spec.env[].value`, `SandboxTemplate.spec.env[].value` | See below |
+| `C-0313` plaintext-upstream-endpoint | `RemoteMCPServer.spec.url`, `ModelProviderConfig.spec.endpoint`, `ModelConfig.spec.{openAI,anthropic,gemini,mistral}.baseUrl`, `ModelConfig.spec.azureOpenAI.azureEndpoint`, `ModelConfig.spec.foundry.endpoint`, `ModelConfig.spec.sapAICore.{baseUrl,authUrl}`, `ModelConfig.spec.ollama.host`, `EgressPolicy.spec.destinations[].origin` | `anthropic`, `gemini` and `mistral` base URLs are new to the list, and so is `origin`, whose pattern accepts `http://`. `foundry.endpointFrom` reads a ConfigMap and cannot be judged from the object alone |
+| `C-0314` mcp-server-unauthenticated | `RemoteMCPServer` | A server is authenticated by a credential header in `headersFrom`, by `tokenPassthrough`, or by `actorJwt`; CEL bars an `Authorization` header alongside either of the last two. The control fails only when none is present. Which header names count is still open (#18 §4) |
+| `C-0315` cross-namespace-reference-scope | `ModelConfig.spec.allowedNamespaces`, `RemoteMCPServer.spec.allowedNamespaces`, `ModelProviderConfig.spec.modelConfigTemplate.allowedNamespaces` | `Agent` no longer has the field; it now sits on the resources that hold credentials. CEL only requires `selector` to be present, so `from: Selector` with `selector: {}` is accepted and matches every namespace. The verdict for that case is still open (#18 §4) |
+| `C-0316` sandbox-egress-allowlist | `EgressPolicy.spec.destinations[].origin`, reached through `Agent.spec.egressPolicyRefs` and `SandboxTemplate.spec.egressPolicyRefs` | `sandbox.network.allowedDomains` is gone. Destinations add origins to a deny baseline. See below for what the schema already rejects |
+| `C-0317` toolserver-local-exec | none | `ToolServer` was removed and no v1.0.1 kind has a stdio MCP transport. The nearest surface is a `byo` `Harness` with `spec.workload.command`, which runs a digest-pinned image. **Proposed: drop this control**, leaving seven |
 
-An implementation that reads only the `.deployment.env` shape — as an earlier draft
-of this document described — misses inline credentials on two of the four served
-shapes. The rule therefore iterates an explicit path list rather than assuming a
-nesting depth.
+#### `C-0312` paths
 
-`C-0312` additionally covers, on the same resources:
-`RemoteMCPServer.spec.headersFrom[].value`,
-`ToolServer.spec.config.{sse,streamableHttp}.headers`,
-`ToolServer.spec.config.stdio.env`, and
-`ModelConfig.spec.azureOpenAI.azureAdToken` — an inline token field on the provider
-sub-object.
+The four env path shapes of the previous revision, and the `ToolServer` header and
+stdio-env cases, are gone. The full list on v1.0.1 is:
+
+| Kind | Path | Shape |
+|---|---|---|
+| `RemoteMCPServer` | `spec.headersFrom[].value` | literal string beside `valueFrom`; only the literal is inline |
+| `ModelConfig` | `spec.azureOpenAI.azureAdToken` | literal string |
+| `ModelConfig` | `spec.defaultHeaders` | `map[string]string`, new in this list |
+| `Harness` | `spec.env[].value` | items have only `name` and a required `value` |
+| `SandboxTemplate` | `spec.env[].value` | items have only `name` and a required `value` |
+
+`Harness` and `SandboxTemplate` env items cannot reference a Secret, so a credential
+there is inline by construction. The name-matching rules #18 §4 asks for decide
+which of those entries the control flags.
+
+#### `C-0316` and the origin pattern
+
+The `origin` pattern already rejects `https://*`, `https://*.com`, `https://*.io`,
+`https://*.*.example.com`, IP literals and uppercase hosts. It accepts
+`https://*.co.uk` and `https://*.github.io`. The only broad case left is a wildcard
+directly over a public suffix, which gives the deterministic predicate #18 asks
+for: fail when the labels after `*.` are a public suffix. Whether that list is a
+pinned Public Suffix List snapshot or a short fixed list is open.
 
 ### Controls
 
@@ -656,3 +671,28 @@ its unit tests, that requirement is the only thing standing between this design 
 a silent false negative.
 
 Also fixed the "three"/"two" default-install typo.
+
+### Round three: Kagent v1.0.x baseline
+
+Kagent v1.0.0 (Nov 9, 2026) moved every kind to `api.kagent.dev/v1alpha3` and
+changed the set of kinds, so the served-version matrix is re-derived from the
+v1.0.1 CRD chart at `558e3d761d8ed2b0d23bfef1867a9d1915210121` (#18 §2 and §3).
+The main effects:
+
+- One group and one version, so the per-version fan-out and the four `C-0312` env
+  shapes are gone.
+- `SandboxAgent` and `ToolServer` are not shipped. `EgressPolicy`, `Harness`,
+  `AgentTemplate` and `SandboxTemplate` are new.
+- `C-0312` gains `ModelConfig.spec.defaultHeaders` and the `Harness` and
+  `SandboxTemplate` env lists. `C-0313` gains the `anthropic`, `gemini` and
+  `mistral` base URLs and `EgressPolicy` origins.
+- `C-0315` now reads `allowedNamespaces` on `ModelConfig`, `RemoteMCPServer` and
+  `ModelProviderConfig`, not `Agent`.
+- `C-0316` reads `EgressPolicy` origins instead of
+  `sandbox.network.allowedDomains`.
+- `C-0317` has no target at v1.0.1 and is proposed for removal.
+
+Only the matrix section is updated in this round. The rule descriptions, fixtures
+and E2E example above still describe the 0.10.x schemas, and follow once the
+baseline is agreed. Control IDs and framework membership (#18 §1) are unchanged
+here.
