@@ -378,6 +378,125 @@ nesting depth.
 `ModelConfig.spec.azureOpenAI.azureAdToken` — an inline token field on the provider
 sub-object.
 
+### Kagent v1.0.x: kinds, versions and field paths
+
+Kagent [v1.0.0](https://github.com/kagent-dev/kagent/releases/tag/v1.0.0) (Nov 9,
+2026) and [v1.0.1](https://github.com/kagent-dev/kagent/releases/tag/v1.0.1)
+(Nov 12, 2026) ship a different API from the 0.10.x line the tables above describe.
+This section maps each control onto that API so the baseline can be chosen with both
+sides in view. It records paths only; control IDs, framework placement and rule
+predicates are unchanged here and still open in
+[#18](https://github.com/kubescape/designs-and-proposals/issues/18).
+
+Source: the
+[v1.0.1 CRD chart](https://github.com/kagent-dev/kagent/tree/558e3d761d8ed2b0d23bfef1867a9d1915210121/helm/kagent-crds/templates)
+at `558e3d761d8ed2b0d23bfef1867a9d1915210121`. The v1.0.0 chart
+(`a08cde76ad6482dd758a4220b14213d79185ac30`) has identical CRDs. Paths and CEL rules
+were read from the CRD schemas; nothing here was checked on a running cluster.
+
+#### Kinds and versions
+
+Every kind is in the API group **`api.kagent.dev`**, served at **`v1alpha3`** only, and
+namespaced.
+
+| Kind | Version | In the 0.10.x chart |
+|---|---|---|
+| `Agent` | `v1alpha3` | Yes, reshaped: `spec.harnessRef` plus `spec.template.{inline,ref}` |
+| `AgentTemplate` | `v1alpha3` | No |
+| `EgressPolicy` | `v1alpha3` | No |
+| `Harness` | `v1alpha3` | No |
+| `ModelConfig` | `v1alpha3` | Yes |
+| `ModelProviderConfig` | `v1alpha3` | Yes |
+| `RemoteMCPServer` | `v1alpha3` | Yes |
+| `SandboxTemplate` | `v1alpha3` | No |
+
+`SandboxAgent`, `ToolServer`, `AgentHarness` and `Memory` are not in the v1.0.x chart.
+
+The group change matters most. A `match` block naming only `kagent.dev` selects
+nothing on a v1.0.x cluster. One naming only `api.kagent.dev` selects nothing on
+0.10.x. Supporting both lines means listing both groups, each with its own versions.
+
+#### Per-control field paths on `v1alpha3`
+
+| Control | Kinds | Paths on `v1alpha3` | Change from 0.10.x |
+|---|---|---|---|
+| `C-0310` | `ModelConfig`, `ModelProviderConfig` | `ModelConfig.spec.tokenPassthrough`; `ModelConfig.spec.apiKeySecret` and `spec.apiKeySecretKey`; `ModelConfig.spec.actorJwt`; `ModelProviderConfig.spec.modelConfigTemplate.auth.{tokenPassthrough,secretRef,actorJwt}` | `apiKeyPassthrough` is renamed `tokenPassthrough`. `actorJwt` is a third credential source, so the "API-key provider with no credential" branch has to accept `actorJwt` as well as `apiKeySecret`. Details below the table |
+| `C-0311` | `ModelConfig`, `RemoteMCPServer` | `spec.tls.disableVerify` on both | `tls` now has only `disableVerify`. `disableSystemCAs` and `caCertSecretRef` are gone from both kinds |
+| `C-0312` | `RemoteMCPServer`, `ModelConfig`, `Harness`, `SandboxTemplate` | `RemoteMCPServer.spec.headersFrom[].value`; `ModelConfig.spec.defaultHeaders` (string map); `ModelConfig.spec.azureOpenAI.azureAdToken`; `Harness.spec.env[].value`; `SandboxTemplate.spec.env[].value` | `Agent` has no env field, so none of the four env shapes above exists. `defaultHeaders` is new. `env[]` on `Harness` and `SandboxTemplate` has no `valueFrom`, so a credential-named variable there is always inline. The `ToolServer` paths are gone |
+| `C-0313` | `RemoteMCPServer`, `ModelProviderConfig`, `ModelConfig`, `EgressPolicy` | `RemoteMCPServer.spec.url`; `ModelProviderConfig.spec.endpoint`; `ModelConfig.spec.` `openAI.baseUrl`, `anthropic.baseUrl`, `gemini.baseUrl`, `mistral.baseUrl`, `azureOpenAI.azureEndpoint`, `foundry.endpoint`, `sapAICore.baseUrl`, `sapAICore.authUrl`, `ollama.host`; `EgressPolicy.spec.destinations[].origin` | New: `anthropic.baseUrl`, `gemini.baseUrl`, `mistral.baseUrl` and `EgressPolicy` origins. `ToolServer` URLs are gone |
+| `C-0314` | `RemoteMCPServer` | `spec.headersFrom`, `spec.actorJwt`, `spec.tokenPassthrough` | `actorJwt` and `tokenPassthrough` both authenticate the request. A rule that looks only at `headersFrom` would fail servers using either mode |
+| `C-0315` | `ModelConfig`, `RemoteMCPServer`, `ModelProviderConfig` | `ModelConfig.spec.allowedNamespaces.from`; `RemoteMCPServer.spec.allowedNamespaces.from`; `ModelProviderConfig.spec.modelConfigTemplate.allowedNamespaces.from` | Removed from `Agent`; `SandboxAgent` is gone. Added on `ModelConfig` and `ModelProviderConfig` |
+| `C-0316` | `EgressPolicy` | `spec.destinations[].origin` | `sandbox.network.allowedDomains` is gone. Egress is granted by `EgressPolicy` objects referenced from `Agent.spec.egressPolicyRefs[]` and `SandboxTemplate.spec.egressPolicyRefs[]` |
+| `C-0317` | none | none | `ToolServer` and its `stdio` transport are not in v1.0.x |
+
+Details behind the table:
+
+- **`C-0310`.** The CRD allows at most one of `actorJwt`, `apiKeySecret` and
+  `tokenPassthrough`.
+  - `tokenPassthrough` is rejected for `Gemini`, `GeminiVertexAI` and
+    `AnthropicVertexAI`.
+  - `actorJwt` is rejected for `Bedrock`, `Ollama`, `GeminiVertexAI`,
+    `AnthropicVertexAI` and `SAPAICore`.
+  - The `provider` enum now has eleven values. `Mistral` is new, with its own
+    `mistral.baseUrl`, and needs a row in the provider table above.
+  - `Bedrock` may now set `apiKeySecret` without `apiKeySecretKey`; the CEL rule
+    exempts it alongside `SAPAICore`.
+  - `ModelProviderConfig` can generate `ModelConfig`s with
+    `modelConfigTemplate.auth.tokenPassthrough: true`. Whether to flag the template,
+    the generated `ModelConfig`s or both is a decision for the rule.
+- **`C-0311`.** On `RemoteMCPServer`, CEL rejects any `tls` block when `spec.url`
+  starts with `http://`, and the field docs say custom CA bundles are not supported.
+  With `disableSystemCAs` gone, the `disableSystemCAs` discussion under `C-0311`
+  above does not apply to v1.0.x.
+- **`C-0312`.** `headersFrom[]` requires exactly one of `value` and `valueFrom`.
+  Secret-backed headers cannot use `Cookie`, `Proxy-Authorization`, or routing and
+  hop-by-hop headers. An inline `value` has none of those restrictions.
+- **`C-0313`.** `foundry.endpointFrom` reads the endpoint from a ConfigMap, so its
+  scheme cannot be checked from the `ModelConfig` alone. The chart's default Ollama
+  value is the scheme-less `host.docker.internal:11434`, so the predicate also needs
+  a verdict for URLs with no scheme. The `RemoteMCPServer` CEL message mentions
+  scheme-less URLs as well.
+- **`C-0314`.** CEL forbids an `Authorization` entry in `headersFrom` when
+  `actorJwt` or `tokenPassthrough` is set, so the three modes do not overlap on that
+  header.
+- **`C-0315`.** The object shape is unchanged: `from` is `All`, `Same` or
+  `Selector`, and defaults to `Same`. On `ModelProviderConfig`, the docs say the
+  field controls which namespaces may reference the discovered models *and their
+  invocation credentials*. On all three kinds, CEL requires a `selector` when `from`
+  is `Selector` but does not reject `selector: {}`. The empty-selector question in
+  #18 section 4 therefore still applies.
+- **`C-0316`.** The `origin` pattern lets a wildcard replace exactly one leftmost
+  label and requires at least two labels after it. The API server therefore already
+  rejects `*` and bare-TLD wildcards like `*.com`. What the schema still admits is
+  the multi-label public-suffix case (`*.co.uk`, `*.github.io`), so that becomes the
+  whole predicate on v1.0.x. Other notes:
+  - Destinations with `authentication` must be exact origins.
+  - The `Agent` docs say access inferred from its models and tools is always
+    included. An `Agent` with no `egressPolicyRefs` therefore still has egress to
+    those integrations, so absence no longer means "deny all".
+  - The rule moves to a separate object. A finding on an `EgressPolicy` does not say
+    which `Agent` uses it; that would need a cross-object join.
+- **`C-0317`.** The nearest v1.0.x construct is a `Harness` with `spec.byo` and
+  `spec.workload.command`. That is a bring-your-own runtime image (which the schema
+  requires to be digest-pinned), not model-driven command execution, so it is not a
+  substitute target.
+
+#### Expected default-install result on v1.0.1
+
+Based on the chart's templates and `values.yaml` (not on an install), the chart
+creates two `RemoteMCPServer`s:
+
+- `<release>-api`, from `templates/toolserver-api.yaml`, created unconditionally;
+- `<release>-tool-server`, from `templates/toolserver-kagent.yaml`, created when
+  `kagent-tools.enabled` is true, which is the default.
+
+Both use an `http://` URL and set none of `headersFrom`, `actorJwt` or
+`tokenPassthrough`. Each would trip `C-0313` and `C-0314`: four findings on two
+objects, where the 0.10.x prediction above is two findings on one object.
+
+Neither sets `allowedNamespaces` by default, so both pass `C-0315`. The default
+`ModelConfig` (OpenAI) sets `apiKeySecret: kagent-openai` and passes `C-0310`.
+
 ### Controls
 
 Eight control JSONs under `controls/`, following the shape the agent-sandbox family
@@ -656,3 +775,13 @@ its unit tests, that requirement is the only thing standing between this design 
 a silent false negative.
 
 Also fixed the "three"/"two" default-install typo.
+
+### Round three
+
+- Added [Kagent v1.0.x: kinds, versions and field paths](#kagent-v10x-kinds-versions-and-field-paths),
+  read from the v1.0.1 CRD chart. Kagent 1.0 moved every kind to `api.kagent.dev/v1alpha3`.
+  - It dropped `SandboxAgent` and `ToolServer`.
+  - It replaced `sandbox.network.allowedDomains` with `EgressPolicy` objects.
+  - It added `actorJwt` as a credential mode on `ModelConfig` and `RemoteMCPServer`.
+
+  The section maps each control onto that API and leaves the baseline choice open.
