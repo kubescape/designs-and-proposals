@@ -153,14 +153,6 @@ Property tests (never stronger), exhaustiveness (registry), golden diff (additiv
 
 Adapters for exposure, vulnerability-exposure, attack-path; `outputSchema` across tools; CLI JSON output; #36 ranking consuming the semantics; live-cluster verification as its own proposal; promote package to public core; align with #15 outcome type.
 
-## Questions for maintainers
-
-1. **Location.** A small package in `kubescape/kubescape` used only by `cmd/mcpserver` at first, promoted when a second consumer exists (recommended), or kept inside `cmd/mcpserver`?
-2. **Verdict model.** Carry domain verdicts verbatim and add shared completeness/limitations/provenance, with no common `established/excluded/indeterminate` enum (recommended), or add a shared verdict?
-3. **First adapter.** Webhook coverage first (recommended), with network reachability first if #5744 is not merged.
-4. **Convergence.** Who should review the mapping to #36's `{value, reason}`, attack-path's `Certain`/`truncated`, and `cautils.ScanCoverage`? Scan-level outcome stays with #15.
-5. **Boundaries.** Is the out-of-scope list right, and is this the right size to pursue at all?
-
 ## Evidence appendix: how each analyzer represents results today
 
 Read at `kubescape/kubescape@8211d46c`.
