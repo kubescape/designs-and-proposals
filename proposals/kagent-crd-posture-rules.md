@@ -558,8 +558,10 @@ All fixtures must validate against the pinned Kagent v1.0.1 CRD schemas
 
 1. kind cluster, Kagent v1.0.x installed from its Helm chart:
    ```sh
-   helm repo add kagent https://kagent-dev.github.io/kagent
-   helm install kagent kagent/kagent --namespace kagent --create-namespace
+   helm install kagent-crds oci://ghcr.io/kagent-dev/kagent/helm/kagent-crds \
+     --version 1.0.1 --namespace kagent --create-namespace
+   helm install kagent oci://ghcr.io/kagent-dev/kagent/helm/kagent \
+     --version 1.0.1 --namespace kagent
    ```
 2. Export the local `regolibrary` bundle:
    ```sh
@@ -777,21 +779,21 @@ spec:
 ### Expected findings matrix
 
 A default Kagent v1.0.1 Helm install (`helm/kagent`) deploys three custom resources:
-1. `ModelConfig` `kagent-default-model` (from `modelconfig.yaml`): configures the default OpenAI provider referencing Secret `kagent-openai`.
+1. `ModelConfig` `default-model-config` (from `modelconfig.yaml`): configures the default OpenAI provider referencing Secret `kagent-openai`.
 2. `RemoteMCPServer` `kagent-tool-server` (from `toolserver-kagent.yaml`): configures the built-in tool server over HTTP without auth.
 3. `RemoteMCPServer` `kagent-api` (from `toolserver-api.yaml`): configures controller API tools over HTTP without auth.
 
 The matrix below differentiates the stock install baseline from the test manifest suites:
 
-| Control ID | Stock Helm Install Findings (`kagent-default-model`, `kagent-tool-server`, `kagent-api`) | Insecure Manifest Set | Secure Manifest Set |
+| Control ID | Stock Helm Install Findings (`default-model-config`, `kagent-tool-server`, `kagent-api`) | Insecure Manifest Set | Secure Manifest Set |
 |---|---|---|---|
-| `C-0323` | **Pass** (`kagent-default-model` correctly references `apiKeySecret: kagent-openai`) | **Fail** (`test-insecure-c0323`) | Pass |
+| `C-0323` | **Pass** (`default-model-config` correctly references `apiKeySecret: kagent-openai`) | **Fail** (`test-insecure-c0323`) | Pass |
 | `C-0324` | **Pass** (`tls` omitted on all default resources; verification enabled by default) | **Fail** (`test-insecure-c0324`) | Pass |
 | `C-0325` | **Pass** (no inline credentials in headers or env) | **Fail** (`test-insecure-c0325`) | Pass |
 | `C-0326` | **Fail (2 findings)** (`kagent-tool-server` and `kagent-api` both configure plaintext `http://` URLs) | **Fail** (`test-insecure-c0326`) | Pass |
 | `C-0327` | **Fail (2 findings)** (`kagent-tool-server` and `kagent-api` declare no authentication mechanism) | **Fail** (`test-insecure-c0327`) | Pass |
 | `C-0328` | **Pass** (`allowedNamespaces` omitted on all default resources, securely defaulting to `Same`) | **Fail** (`test-insecure-c0328`) | Pass |
-| `C-0329` | **Pass** (no default `EgressPolicy` deployed; cluster operates under secure default-deny) | **Fail** (`test-insecure-c0329`) | Pass |
+| `C-0329` | **Pass** (the chart creates no `EgressPolicy`, so there is nothing to evaluate) | **Fail** (`test-insecure-c0329`) | Pass |
 
 ### Expected result on a default install, stated up front
 
@@ -832,7 +834,7 @@ Both resources specify plaintext `http://` URLs and declare no authentication me
 - **`C-0326`** (plaintext upstream endpoint) — 2 findings
 - **`C-0327`** (MCP server without authentication) — 2 findings
 
-In contrast, the default `ModelConfig` resource (`kagent-default-model`) safely references `kagent-openai`
+In contrast, the default `ModelConfig` resource (`default-model-config`) safely references `kagent-openai`
 and passes `C-0323`. Neither resource trips `C-0328` because `allowedNamespaces` is omitted, which defaults
 to `from: Same`.
 
@@ -923,10 +925,10 @@ Recorded so reviewers can see what moved rather than re-reading the whole docume
   - Defined MCP server authentication mechanisms under `C-0327`.
   - Codified verdict for `from: Selector` with empty `selector: {}` as **Fail** under `C-0328`.
   - Codified deterministic public-suffix wildcard check with curated list under `C-0329`.
-- **Schema-valid fixtures and E2E manifests:** Validated all 14 test manifests against
-  the OpenAPI v3 schemas from the pinned Kagent v1.0.1 CRDs (enforcing required `model`
-  on `ModelConfig`, required `description` on `RemoteMCPServer`, and `{type, name, key}`
-  on `valueFrom`).
+- **Schema-valid fixtures and E2E manifests:** All 16 manifests in this document (the 14
+  test manifests and the 2 stock examples) are admitted by `kubectl-validate` against the
+  Kagent v1.0.1 CRDs, OpenAPI schema and CEL rules (required `model` on `ModelConfig`,
+  required `description` on `RemoteMCPServer`, and `{type, name, key}` on `valueFrom`).
 - **Stock install verification:** Verified the exact custom resources rendered by
-  stock `helm/kagent` (`kagent-default-model`, `kagent-tool-server`, and `kagent-api`)
+  stock `helm/kagent` (`default-model-config`, `kagent-tool-server`, and `kagent-api`)
   and documented the expected 4 findings in the findings matrix.
